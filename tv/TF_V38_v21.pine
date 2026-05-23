@@ -1,0 +1,299 @@
+//+------------------------------------------------------------------+
+//| Trend Follower V38.40 - Session Separation [日夜盤股性分流]      |
+//| v21 變更：移除 BE Stop → v3 出場邏輯，ADX 20 只套用 L_Cmd      |
+//+------------------------------------------------------------------+
+//@version=5
+strategy("TF V38.0519_v21 Session", overlay=true, initial_capital=400000, default_qty_type=strategy.fixed, default_qty_value=1, pyramiding=4, commission_type=strategy.commission.cash_per_contract, commission_value=20)
+
+// ==========================================
+// 1. 核心參數
+// ==========================================
+grp_time = "🚀 加速設定"
+useDateFilter = input.bool(true, "啟用起始日過濾", group=grp_time)
+startYear     = input.int(2022, "起始年", group=grp_time)
+startMonth    = input.int(1,    "起始月", group=grp_time)
+startDay      = input.int(1,    "起始日", group=grp_time)
+startTime = timestamp(startYear, startMonth, startDay, 0, 0)
+bool inDateRange = not useDateFilter or time >= startTime
+
+grp_core = "多時框濾網 (MTF)"
+useMtf = input.bool(true, "啟用 60分K 大趨勢濾網", group=grp_core)
+mtfPeriod = input.timeframe("60", "大趨勢週期", group=grp_core)
+
+grp_local = "5分K 引擎設定"
+l_emaLenLong  = input.int(130, "做多母單 EMA 長度", group=grp_local)
+l_emaLenShort = input.int(125, "做空母單 EMA 長度", group=grp_local)
+
+grp_session = "🌗 日夜盤股性分流 (Session)"
+useSession = input.bool(true, "啟用日夜盤動態追蹤", group=grp_session)
+g_trailMultDay   = input.float(0.8, "☀️ 日盤游擊追蹤 (ATR)", group=grp_session, step=0.1, tooltip="台灣法人主導，趨勢連貫，適合緊迫盯人")
+g_trailMultNight = input.float(1.5, "🌙 夜盤游擊追蹤 (ATR)", group=grp_session, step=0.1, tooltip="美股主導，上下洗盤劇烈，需放寬防守避免被洗")
+
+grp_g = "⚔️ 第四階游擊單"
+useGuerrilla = input.bool(true, "啟用第四階游擊單", group=grp_g)
+fastEmaLen   = input.int(35, "游擊單防守 EMA 長度", group=grp_g, step=1)
+g_slMult     = input.float(200.0, "游擊單專屬停損 (200=無)", group=grp_g, step=10.0)
+
+// ADX 只用於 L_Cmd 進場過濾
+grp_filter = "ADX 趨勢強度濾網 (L_Cmd 專用)"
+useAdx    = input.bool(true, "啟用 ADX 濾網", group=grp_filter)
+adxLen    = input.int(14, "ADX 長度", group=grp_filter)
+adxThresh = input.int(20, "ADX 門檻 (L_Cmd 用)", group=grp_filter)
+
+grp_risk = "風險管理"
+l_slMult    = input.float(3.0, "多單停損 (ATR)", group=grp_risk)
+l_trailBase = input.float(5.0, "多單母單追蹤 (ATR)", group=grp_risk)
+l_trailAdd  = input.float(3.8, "多單加碼追蹤 (ATR)", group=grp_risk)
+l_pyramid_dist = input.float(1.2, "多單加碼間距 (ATR)", group=grp_risk)
+be_trigger  = input.float(2.0, "保本觸發門檻 (ATR 倍數)", group=grp_risk)
+
+s_slMult    = input.float(2.5, "空單停損 (ATR)", group=grp_risk)
+s_trailMult = input.float(3.0, "空單母單追蹤 (ATR)", group=grp_risk)
+s_pyramid_dist = input.float(1.0, "空單加碼間距 (ATR)", group=grp_risk)
+
+// ==========================================
+// 2. 指標與時間計算
+// ==========================================
+atrVal = ta.atr(14)
+volMA  = ta.sma(volume, 20)
+isVolSpike = volume > volMA * 2.0
+emaLocalLong  = ta.ema(close, l_emaLenLong)
+emaLocalShort = ta.ema(close, l_emaLenShort)
+emaFast       = ta.ema(close, fastEmaLen)
+
+[isMtfBull, isMtfBear] = request.security(syminfo.tickerid, mtfPeriod, [close > ta.ema(close, l_emaLenLong), close < ta.ema(close, l_emaLenShort)], lookahead=barmerge.lookahead_off)
+
+bool finalMtfBull = not useMtf or isMtfBull
+bool finalMtfBear = not useMtf or isMtfBear
+
+[diplus, diminus, adxVal] = ta.dmi(adxLen, adxLen)
+bool isAdxOk = not useAdx or (adxVal > adxThresh)
+
+// --- 時間判定 ---
+int t_h = hour(time, "Asia/Taipei")
+bool isBaseToxic = (t_h >= 15 and t_h <= 20) or (t_h == 1) or (t_h == 2)
+bool isLongToxic = isBaseToxic or (t_h == 4)
+bool isShortToxic = isBaseToxic or (t_h == 21)
+
+bool isDaySession = (t_h >= 8 and t_h <= 13)
+float current_g_trail = useSession ? (isDaySession ? g_trailMultDay : g_trailMultNight) : g_trailMultDay
+
+// ==========================================
+// 3. 進場與加碼
+// ==========================================
+var float baseATR = na
+var float addATR = na
+var float gATR = na
+
+float posSize = strategy.position_size
+float avgPrice = strategy.position_avg_price
+
+if (posSize == 0)
+    baseATR := atrVal
+    addATR := atrVal
+    gATR := atrVal
+
+bool longTrigger  = (ta.crossover(ta.ema(close, 10), ta.ema(close, 30)) or ta.crossover(close, ta.highest(high, 20)[1]))
+bool shortTrigger = ta.crossunder(close, ta.lowest(low, 20)[1])
+
+// --- 多單邏輯 ---
+if inDateRange
+    // ADX 只用於 L_Cmd
+    if (posSize == 0 and not isLongToxic and finalMtfBull and close > emaLocalLong and longTrigger and isAdxOk)
+        strategy.entry("Long_Cmd", strategy.long, comment="L_Cmd")
+        baseATR := atrVal
+
+    if (posSize > 0 and posSize < 3 and not isLongToxic and finalMtfBull and close > avgPrice + (baseATR * l_pyramid_dist))
+        strategy.entry("Long_Add", strategy.long, comment="L_Add")
+        addATR := atrVal
+
+    if (posSize == 3 and useGuerrilla and not isLongToxic and close > avgPrice + (baseATR * l_pyramid_dist))
+        strategy.entry("Long_G", strategy.long, comment="L_G_進")
+        gATR := atrVal
+
+// --- 空單邏輯 ---
+if inDateRange
+    // S_Cmd 不加 ADX
+    if (posSize == 0 and not isShortToxic and finalMtfBear and close < emaLocalShort and shortTrigger)
+        strategy.entry("Short_Cmd", strategy.short, comment="S_Cmd")
+        baseATR := atrVal
+
+    if (posSize < 0 and posSize > -3 and not isShortToxic and finalMtfBear and close < avgPrice - (baseATR * s_pyramid_dist))
+        strategy.entry("Short_Add", strategy.short, comment="S_Add")
+        addATR := atrVal
+
+    if (posSize == -3 and useGuerrilla and not isShortToxic and close < avgPrice - (baseATR * s_pyramid_dist))
+        strategy.entry("Short_G", strategy.short, comment="S_G_進")
+        gATR := atrVal
+
+// ==========================================
+// 4. 出場邏輯（v3 原始邏輯，無 BE Stop）
+// ==========================================
+fixedOffset = 1
+if posSize != 0
+    float openPrice = strategy.opentrades.entry_price(strategy.opentrades - strategy.opentrades)
+    float currentProfit = 0.0
+    float effectiveAddATR = na(addATR) ? baseATR : addATR
+    float effectiveGATR = na(gATR) ? effectiveAddATR : gATR
+
+    // --- 多單出場 ---
+    if posSize > 0
+        currentProfit := close - openPrice
+        if currentProfit > (baseATR * be_trigger)
+            strategy.exit("L_BE", from_entry="Long_Cmd", stop=openPrice)
+
+        strategy.exit("L_Exit", from_entry="Long_Cmd", trail_points=(baseATR * l_trailBase)/syminfo.mintick, trail_offset=fixedOffset, loss=(baseATR * l_slMult)/syminfo.mintick)
+        strategy.exit("L_Exit_Add", from_entry="Long_Add", trail_points=(effectiveAddATR * l_trailAdd)/syminfo.mintick, trail_offset=fixedOffset, loss=(effectiveAddATR * 5.0)/syminfo.mintick)
+
+        if useGuerrilla
+            strategy.exit("L_Exit_G", from_entry="Long_G", trail_points=(effectiveGATR * current_g_trail)/syminfo.mintick, trail_offset=fixedOffset, loss=(effectiveGATR * g_slMult)/syminfo.mintick)
+            if ta.crossunder(close, emaFast)
+                strategy.close("Long_G", comment="L_G_Cut")
+
+        if ta.crossunder(close, emaLocalLong)
+            strategy.close_all(comment="Trend Rev")
+
+    // --- 空單出場 ---
+    if posSize < 0
+        currentProfit := openPrice - close
+        if currentProfit > (baseATR * be_trigger)
+            strategy.exit("S_BE", from_entry="Short_Cmd", stop=openPrice)
+
+        strategy.exit("S_Exit", from_entry="Short_Cmd", trail_points=(baseATR * s_trailMult)/syminfo.mintick, trail_offset=fixedOffset, loss=(baseATR * s_slMult)/syminfo.mintick)
+        strategy.exit("S_Exit_Add", from_entry="Short_Add", trail_points=(effectiveAddATR * s_trailMult)/syminfo.mintick, trail_offset=fixedOffset, loss=(effectiveAddATR * 4.5)/syminfo.mintick)
+
+        if useGuerrilla
+            strategy.exit("S_Exit_G", from_entry="Short_G", trail_points=(effectiveGATR * current_g_trail)/syminfo.mintick, trail_offset=fixedOffset, loss=(effectiveGATR * g_slMult)/syminfo.mintick)
+            if ta.crossover(close, emaFast)
+                strategy.close("Short_G", comment="S_G_Cut")
+
+        if ta.crossover(close, emaLocalShort)
+            strategy.close_all(comment="Trend Rev")
+
+// ==========================================
+// 5. 戰情儀表板
+// ==========================================
+plot(emaLocalLong, color=color.blue, title="EMA Base (Long)")
+plot(emaLocalShort, color=color.orange, title="EMA Base (Short)")
+plot(useGuerrilla and math.abs(posSize)>0 ? emaFast : na, color=color.fuchsia, title="EMA Fast (Guerrilla)", linewidth=2, style=plot.style_cross)
+
+bgcolor(isBaseToxic ? color.new(color.gray, 90) : na)
+
+var float mtd_pnl = 0.0
+var int mtd_trades = 0
+var int mtd_wins = 0
+var float mtd_peak = 0.0
+var float mtd_max_dd = 0.0
+
+bool new_month = month(time) != month(time[1])
+if new_month
+    mtd_pnl := 0.0
+    mtd_trades := 0
+    mtd_wins := 0
+    mtd_peak := strategy.equity
+    mtd_max_dd := 0.0
+else
+    mtd_peak := math.max(mtd_peak, strategy.equity)
+    mtd_max_dd := math.max(mtd_max_dd, mtd_peak - strategy.equity)
+
+if strategy.closedtrades > strategy.closedtrades[1]
+    float last_trade_pnl = strategy.netprofit - strategy.netprofit[1]
+    mtd_pnl := mtd_pnl + last_trade_pnl
+    mtd_trades := mtd_trades + 1
+    if last_trade_pnl > 0
+        mtd_wins := mtd_wins + 1
+
+var table board = table.new(position.top_right, 2, 12, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+
+if barstate.islast
+    table.cell(board, 0, 0, "策略版本", text_color=color.white, bgcolor=color.gray)
+    table.cell(board, 1, 0, "V38.40 v21 (ADX L_Cmd / No BEStop)", text_color=color.white, bgcolor=color.gray)
+
+    float mtd_roi = (mtd_pnl / 400000) * 100
+    string mtdStr = str.tostring(mtd_pnl, "#") + " (" + str.tostring(mtd_roi, "#.1") + "%)"
+    table.cell(board, 0, 1, "本月損益 (ROI)", text_color=color.white)
+    table.cell(board, 1, 1, mtdStr, text_color=mtd_pnl >= 0 ? color.green : color.red)
+
+    table.cell(board, 0, 2, "本月回撤 (MDD)", text_color=color.white)
+    table.cell(board, 1, 2, str.tostring(mtd_max_dd, "#"), text_color=color.red)
+
+    string tradeCountStr = str.tostring(mtd_trades) + " 筆 (勝 " + str.tostring(mtd_wins) + ")"
+    table.cell(board, 0, 3, "本月交易", text_color=color.white)
+    table.cell(board, 1, 3, tradeCountStr, text_color=color.yellow)
+
+    table.cell(board, 0, 4, "-----------", text_color=color.gray)
+    table.cell(board, 1, 4, "-----------", text_color=color.gray)
+
+    float curProfitCalc = 0.0
+    if posSize > 0
+        curProfitCalc := close - strategy.opentrades.entry_price(strategy.opentrades - strategy.opentrades)
+    else if posSize < 0
+        curProfitCalc := strategy.opentrades.entry_price(strategy.opentrades - strategy.opentrades) - close
+
+    string beStr = "未觸發"
+    if posSize != 0
+        if curProfitCalc > (baseATR * be_trigger)
+            beStr := "已保本 🔒"
+        else
+            beStr := "距: " + str.tostring((baseATR * be_trigger) - curProfitCalc, "#")
+    table.cell(board, 0, 5, "保本機制", text_color=color.white)
+    table.cell(board, 1, 5, beStr, text_color=curProfitCalc > (baseATR * be_trigger) ? color.green : color.gray)
+
+    string posText = "空手 ⚪"
+    color posColor = color.gray
+    if posSize > 0
+        if posSize == 4
+            posText := "多 (3 + 1游擊) ⚔️"
+        else
+            posText := "多 (" + str.tostring(math.abs(posSize)) + " 主力) 🔥"
+        posColor := color.green
+    else if posSize < 0
+        if math.abs(posSize) == 4
+            posText := "空 (3 + 1游擊) ⚔️"
+        else
+            posText := "空 (" + str.tostring(math.abs(posSize)) + " 主力) 🛡️"
+        posColor := color.red
+
+    table.cell(board, 0, 6, "目前持倉", text_color=color.white)
+    table.cell(board, 1, 6, posText, text_color=posColor)
+
+    string mtfStr = finalMtfBull ? "多頭趨勢" : finalMtfBear ? "空頭趨勢" : "盤整"
+    color mtfCol = finalMtfBull ? color.green : finalMtfBear ? color.red : color.gray
+    table.cell(board, 0, 7, "60分K 趨勢", text_color=color.white)
+    table.cell(board, 1, 7, mtfStr, text_color=mtfCol)
+
+    string addStr = "無"
+    if posSize > 0
+        float nextAddPrice = avgPrice + (baseATR * l_pyramid_dist)
+        if posSize < 3
+            addStr := str.tostring(nextAddPrice, "#") + " (主力)"
+        else if posSize == 3 and useGuerrilla
+            addStr := str.tostring(nextAddPrice, "#") + " (游擊) ⚔️"
+        else
+            addStr := "全軍出擊 (Max 4)"
+    else if posSize < 0
+        float nextAddPrice = avgPrice - (baseATR * s_pyramid_dist)
+        if posSize > -3
+            addStr := str.tostring(nextAddPrice, "#") + " (主力)"
+        else if posSize == -3 and useGuerrilla
+            addStr := str.tostring(nextAddPrice, "#") + " (游擊) ⚔️"
+        else
+            addStr := "全軍出擊 (Max 4)"
+
+    table.cell(board, 0, 8, "加碼目標", text_color=color.white)
+    table.cell(board, 1, 8, addStr, text_color=color.yellow)
+
+    float trendExitPrice = posSize < 0 ? emaLocalShort : emaLocalLong
+    string exitStr = posSize != 0 ? str.tostring(trendExitPrice, "#") : "無"
+    table.cell(board, 0, 9, "主力防守", text_color=color.white)
+    table.cell(board, 1, 9, exitStr, text_color=color.orange)
+
+    string fastExitStr = math.abs(posSize) == 4 and useGuerrilla ? str.tostring(emaFast, "#") + " (啟動中)" : "待命中"
+    table.cell(board, 0, 10, "游擊防守 (EMA 35)", text_color=color.white)
+    table.cell(board, 1, 10, fastExitStr, text_color=math.abs(posSize) == 4 ? color.fuchsia : color.gray)
+
+    string sessionStr = "未啟用"
+    if useSession
+        sessionStr := isDaySession ? "☀️ 日盤 ("+str.tostring(current_g_trail, "#.1")+" ATR)" : "🌙 夜盤 ("+str.tostring(current_g_trail, "#.1")+" ATR)"
+    table.cell(board, 0, 11, "當前股性 / 游擊追蹤", text_color=color.white)
+    table.cell(board, 1, 11, sessionStr, text_color=isDaySession ? color.yellow : color.aqua)

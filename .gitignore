@@ -1,0 +1,8 @@
+.env
+*.pfx
+*.log
+venv/
+__pycache__/
+*.pyc
+backtest/mxf_1min.csv
+logs/
