@@ -63,7 +63,7 @@ sudo supervisorctl tail -f trading-app   # 即時 log
 ### 版本
 
 - `tv/TF_V38_v20.pine` — 前一版
-- `tv/TF_V38_v21.pine` — **當前部署版本**
+- `tv/TF_V38_v26.pine` — **當前部署版本**
 
 ### 策略核心邏輯（V38 系列）
 
@@ -230,7 +230,8 @@ KevinYang515/tmf-bot (public)             ← 程式碼 + 文件（本 repo）
 │   ├── fetch_kbars.py
 │   └── backtest_breakout.py
 └── tv/
-    ├── TF_V38_v21.pine     ← 當前部署版
+    ├── TF_V38_v26.pine     ← 當前部署版
+    ├── TF_V38_v21.pine
     └── TF_V38_v20.pine
 ```
 
