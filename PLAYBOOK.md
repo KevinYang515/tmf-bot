@@ -1,7 +1,46 @@
 # TMF 自動交易系統 Playbook
 
-> 最後更新：2026-06-07（v26 回測 + 實盤更新）
+> 最後更新：2026-06-20（新增 VM / 本機分工原則）
 > 適用：新 session 快速 onboarding、策略回顧、系統維護
+
+---
+
+## 0. ⚖️ VM 與本機分工原則（**讀其他章節前必看**）
+
+| 角色 | 機器 | 為什麼 |
+|------|------|--------|
+| **下單 / Live Trading** | **GCP VM 35.212.129.240** | 24/7 穩定、不受筆電開關機影響 |
+| **Backtest / Grid Search** | **本機 D:\stock** | iterate 快、無 SSH lag、debug 容易 |
+| **資料抓取 (finlab / Shioaji / yfinance)** | **本機** | VIP token 任何地方都能用 |
+| **資料分析 / 探索性研究** | **本機** | 同上 |
+| **Streamlit 部署** | GitHub → streamlit.app | 由本機 push |
+
+### VM 上「只能」放的東西
+- `app.py`（Flask webhook + Shioaji 下單）
+- `logs/`（balance_log.csv、trade_records.csv）
+- 必要 cron（balance snapshot、git sync）
+- 換月 / 對帳腳本
+
+### VM 上「絕對不要」放的東西
+- backtest / grid search 腳本
+- 研究用的 1-min K / tick 資料（除非當天要回推給本機）
+- 資料探索 notebook、長時間 Python script
+
+### 為什麼這個分工很重要
+
+- **GCP SSH banner exchange 偶爾抽風** → backtest 跑到一半 SSH 斷線、log 沒 flush、結果取不回。本 session（2026-06-20）已遇兩次。
+- VM 是 e2-small 等級，跑 grid search 會跟 TMF live trading 搶 CPU/memory
+- 本機 iterate 快十倍，IDE debug 直接，print 直接看
+- VM 出狀況時，職責單一比較容易救（只跑 app.py 一件事）
+
+### 真正的教訓
+- 之前把 Strategy C v1/v2 backtest 直接跑在 VM 上 — 結果 SSH 抽風時取不回，浪費時間。
+- 正確流程：scp 資料下來 → 本機跑 → 結果 push GitHub。
+
+### 本機 Python 環境
+
+- **主要 env：** `D:\Users\USER\Miniconda3\envs\stock312\python.exe` (Python 3.12.13)
+- **已裝：** finlab 2.0.13, pandas 3.0.3, pyarrow 24.0.0, numpy, scipy
 
 ---
 
