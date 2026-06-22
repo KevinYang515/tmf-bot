@@ -1,7 +1,10 @@
 # TMF 自動交易系統 Playbook
 
-> 最後更新：2026-06-20（新增 VM / 本機分工原則）
+> 最後更新：2026-06-22（部署 NQ-TMF v2(B)）
 > 適用：新 session 快速 onboarding、策略回顧、系統維護
+>
+> **相關文件**：
+> - [NQ_TMF_STRATEGY.md](./NQ_TMF_STRATEGY.md) — 第二支獨立策略：用 NQ 訊號交易 TMF（service: `trading-tmf-nq`）
 
 ---
 
