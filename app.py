@@ -349,6 +349,14 @@ def execute_trade_alignment(target_pos, signal_price=None, ticker="Unknown"):
             )
             trade = api.place_order(contract, order)
 
+            # 立即 dump 完整 trade.status / order 物件 (debug Status.Failed 原因)
+            try:
+                import pprint as _pp
+                logger.info(f"[Submit] trade.status raw = {_pp.pformat(trade.status.__dict__, compact=True)[:500]}")
+                logger.info(f"[Submit] order raw = {_pp.pformat(trade.order.__dict__, compact=True)[:500]}")
+            except Exception as _e:
+                logger.warning(f"[Submit] dump trade obj fail: {_e}")
+
             # 等待成交回報
             logger.info("等待成交回報 (2s)...")
             time.sleep(2)
