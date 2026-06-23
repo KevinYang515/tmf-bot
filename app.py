@@ -143,7 +143,9 @@ def _git_push_csv():
     repo = Path(__file__).parent
     ts = datetime.now(TZ_TW).strftime("%Y-%m-%d %H:%M:%S")
     try:
-        subprocess.run(["git", "-C", str(repo), "add", "logs/trade_records.csv"],
+        # 同時 add trade_records 跟 webhook_raw（webhook log 給 dashboard 看漏單統計）
+        subprocess.run(["git", "-C", str(repo), "add",
+                        "logs/trade_records.csv", "logs/webhook_raw.csv"],
                        check=True, capture_output=True)
         result = subprocess.run(
             ["git", "-C", str(repo), "commit", "-m", f"trade: {ts}"],
