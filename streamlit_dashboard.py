@@ -200,35 +200,88 @@ if not pnl_df.empty:
     st.caption(f"每筆成交後的累計實現損益。{len(pnl_df)} 筆。")
 
 # ==========================================
-# Section 3: 期間統計（本日 / 本週 / 本月 / 全期）
+# Section 3: 時間軸績效拆分 (月 / 週 / 日)
 # ==========================================
 st.divider()
-st.markdown("### 📅 期間統計對比")
+st.markdown("### 📅 時間軸績效拆分")
 
-def period_stats(start_date, end_date, label):
-    sub = pnl_df[(pnl_df["date"] >= start_date) & (pnl_df["date"] <= end_date)]
-    s = stats(sub["realized_pnl"])
-    return {"period": label, **s}
+def by_period(pnl_df, period_key):
+    """period_key: 'month' / 'week' / 'day'"""
+    df = pnl_df.copy()
+    df["dt"] = pd.to_datetime(df["date"])
+    if period_key == "month":
+        df["bucket"] = df["dt"].dt.strftime("%Y-%m")
+    elif period_key == "week":
+        df["bucket"] = df["dt"].dt.to_period("W-SUN").apply(lambda p: f"{p.start_time.strftime('%m/%d')}~{p.end_time.strftime('%m/%d')}")
+    else:  # day
+        df["bucket"] = df["dt"].dt.strftime("%Y-%m-%d")
 
-periods = [
-    period_stats(today, today, "🌟 今日"),
-    period_stats(this_week_start, today, "📆 本週"),
-    period_stats(this_month_start, today, "📅 本月"),
-    period_stats(first_date, today, "🌍 全期"),
-]
-pdf = pd.DataFrame(periods)
-pdf.rename(columns={
-    "period": "期間", "n": "筆數", "total": "總 PnL", "WR": "勝率%",
-    "PF": "PF", "avg_win": "均勝", "avg_loss": "均敗",
-    "max_win": "最大單筆勝", "max_loss": "最大單筆敗",
-}, inplace=True)
+    rows = []
+    cum = 0
+    for b, g in df.groupby("bucket", sort=False):
+        s = stats(g["realized_pnl"])
+        cum += s["total"]
+        rows.append({
+            "區間": b,
+            "筆數": s["n"],
+            "PnL": s["total"],
+            "累計": cum,
+            "勝率%": s["WR"],
+            "PF": s["PF"],
+            "均勝": s["avg_win"],
+            "均敗": s["avg_loss"],
+            "最大單筆勝": s["max_win"],
+            "最大單筆敗": s["max_loss"],
+        })
+    return pd.DataFrame(rows)
 
-# Format numbers
-for c in ["總 PnL", "均勝", "均敗", "最大單筆勝", "最大單筆敗"]:
-    pdf[c] = pdf[c].apply(lambda x: f"{int(x):+,}")
-pdf["勝率%"] = pdf["勝率%"].apply(lambda x: f"{x}%")
 
-st.dataframe(pdf, use_container_width=True, hide_index=True)
+def format_period_df(df):
+    out = df.copy()
+    for c in ["PnL", "累計", "均勝", "均敗", "最大單筆勝", "最大單筆敗"]:
+        out[c] = out[c].apply(lambda x: f"{int(x):+,}")
+    out["勝率%"] = out["勝率%"].apply(lambda x: f"{x}%")
+    return out
+
+
+tab_month, tab_week, tab_day = st.tabs(["📅 每月", "📆 每週", "🌟 每日"])
+
+with tab_month:
+    mdf = by_period(pnl_df, "month")
+    if mdf.empty:
+        st.info("無資料")
+    else:
+        # 月度 PnL bar chart
+        chart_df = mdf.set_index("區間")[["PnL"]]
+        st.bar_chart(chart_df, height=240)
+        st.dataframe(format_period_df(mdf), use_container_width=True, hide_index=True)
+        st.caption(f"共 {len(mdf)} 個月，正月份 {(mdf['PnL'] > 0).sum()}，"
+                   f"負月份 {(mdf['PnL'] < 0).sum()}")
+
+with tab_week:
+    wdf = by_period(pnl_df, "week")
+    if wdf.empty:
+        st.info("無資料")
+    else:
+        # 最近 12 週
+        wdf_show = wdf.tail(12)
+        chart_df = wdf_show.set_index("區間")[["PnL"]]
+        st.bar_chart(chart_df, height=240)
+        st.dataframe(format_period_df(wdf_show), use_container_width=True, hide_index=True)
+        st.caption(f"顯示最近 12 週 (全期共 {len(wdf)} 週)；正週 {(wdf['PnL'] > 0).sum()} / 負週 {(wdf['PnL'] < 0).sum()}")
+
+with tab_day:
+    ddf = by_period(pnl_df, "day")
+    if ddf.empty:
+        st.info("無資料")
+    else:
+        # 最近 30 個有交易日
+        ddf_show = ddf.tail(30)
+        chart_df = ddf_show.set_index("區間")[["PnL"]]
+        st.bar_chart(chart_df, height=240)
+        st.dataframe(format_period_df(ddf_show), use_container_width=True, hide_index=True)
+        st.caption(f"顯示最近 30 個有交易日 (全期共 {len(ddf)} 天)；"
+                   f"正天 {(ddf['PnL'] > 0).sum()} / 負天 {(ddf['PnL'] < 0).sum()}")
 
 # ==========================================
 # Section 4: 漏單統計（如果 webhook log 有資料）
