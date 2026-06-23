@@ -88,11 +88,51 @@ TRADE_HEADERS = [
     "pos_before", "target_pos", "order_status", "note"
 ]
 
+# Webhook raw payload log — 抓 TV 真實送進來的完整資料用，用來 debug 漏單
+WEBHOOK_LOG_CSV = "logs/webhook_raw.csv"
+WEBHOOK_LOG_HEADERS = [
+    "received_at", "ticker", "target_pos", "signal_price",
+    "order_action", "order_comment", "order_contracts", "order_id",
+    "tv_timestamp", "decision", "raw_payload"
+]
+
 def init_trade_csv():
     path = Path(TRADE_CSV)
     if not path.exists():
         with open(TRADE_CSV, 'w', newline='', encoding='utf-8-sig') as f:
             csv.DictWriter(f, fieldnames=TRADE_HEADERS).writeheader()
+
+def init_webhook_log():
+    path = Path(WEBHOOK_LOG_CSV)
+    if not path.exists():
+        with open(WEBHOOK_LOG_CSV, 'w', newline='', encoding='utf-8-sig') as f:
+            csv.DictWriter(f, fieldnames=WEBHOOK_LOG_HEADERS).writeheader()
+
+_webhook_log_lock = threading.Lock()
+
+def log_webhook_raw(data: dict, decision: str):
+    """寫所有進來的 webhook (含被 dedup 殺掉的)"""
+    import json as _json
+    now_iso = datetime.now(TZ_TW).isoformat(timespec="seconds")
+    row = {
+        "received_at": now_iso,
+        "ticker": (data or {}).get("ticker", ""),
+        "target_pos": (data or {}).get("target_pos", ""),
+        "signal_price": (data or {}).get("signal_price", ""),
+        "order_action": (data or {}).get("order_action", ""),
+        "order_comment": (data or {}).get("order_comment", ""),
+        "order_contracts": (data or {}).get("order_contracts", ""),
+        "order_id": (data or {}).get("order_id", ""),
+        "tv_timestamp": (data or {}).get("timestamp", ""),
+        "decision": decision,
+        "raw_payload": _json.dumps(data or {}, ensure_ascii=False),
+    }
+    try:
+        with _webhook_log_lock:
+            with open(WEBHOOK_LOG_CSV, 'a', newline='', encoding='utf-8-sig') as f:
+                csv.DictWriter(f, fieldnames=WEBHOOK_LOG_HEADERS).writerow(row)
+    except Exception as e:
+        logger.error(f"[WebhookLog] write fail: {e}")
 
 def append_trade_csv(record: dict):
     with open(TRADE_CSV, 'a', newline='', encoding='utf-8-sig') as f:
@@ -143,6 +183,7 @@ def _push_pending_commits():
         logger.warning(f"[Git] 啟動補推失敗: {e}")
 
 init_trade_csv()
+init_webhook_log()
 threading.Thread(target=_push_pending_commits, daemon=True).start()
 
 # ==========================================
@@ -437,23 +478,30 @@ def webhook():
     if WEBHOOK_SECRET:
         if request.args.get("token", "") != WEBHOOK_SECRET:
             logger.warning("[Auth] 未授權請求，已拒絕。")
+            log_webhook_raw(request.get_json(silent=True) or {}, "REJECT_UNAUTH")
             return jsonify({"status": "error", "msg": "Unauthorized"}), 401
+
+    data = request.get_json(silent=True)
+    if not data:
+        log_webhook_raw({}, "REJECT_EMPTY")
+        return jsonify({"status": "error", "msg": "Empty data"}), 400
 
     # 期交所休息時間
     now = datetime.now(TZ_TW)
     if (now.hour == 13 and now.minute >= 45) or (now.hour == 14):
         logger.warning("[Signal] 休息時間，拒絕下單 (13:45-15:00)")
+        log_webhook_raw(data, "REJECT_MARKET_CLOSED")
         return jsonify({"status": "ignored", "msg": "Market Closed"}), 200
 
-    data = request.json
-    if not data:
-        return jsonify({"status": "error", "msg": "Empty data"}), 400
-
     incoming_ticker = data.get('ticker', 'Unknown')
+    order_action  = data.get('order_action', '')   # buy / sell (TV strategy.order.action)
+    order_comment = data.get('order_comment', '')  # e.g. "S_Exit", "L_Add"
+    order_id      = data.get('order_id', '')
 
     try:
         target_pos = int(data.get('target_pos', 0))
     except (TypeError, ValueError):
+        log_webhook_raw(data, "REJECT_BAD_TARGET_POS")
         return jsonify({"status": "error", "msg": "Invalid target_pos"}), 400
 
     # signal_price：TradingView alert 帶入 {{close}}
@@ -463,26 +511,30 @@ def webhook():
         signal_price = None
 
     # 重複信號防護 (5 秒內相同目標部位)
+    # NOTE: 已知問題 - 同 K bar 多 fill 若 target_pos 一樣會被誤殺，待 review
     global _last_signal_time, _last_signal_target
     with _last_signal_lock:
         if (_last_signal_target == target_pos and
                 _last_signal_time is not None and
                 (now - _last_signal_time).total_seconds() < 5):
-            logger.warning(f"[Signal] 重複信號略過: target_pos={target_pos}")
+            logger.warning(f"[Signal] 重複信號略過: target_pos={target_pos} comment={order_comment}")
+            log_webhook_raw(data, f"DEDUP_DROPPED")
             return jsonify({"status": "ignored", "msg": "Duplicate signal"}), 200
         _last_signal_time   = now
         _last_signal_target = target_pos
 
-    logger.info(f"[Signal] {incoming_ticker} | target={target_pos} | signal_price={signal_price}")
+    logger.info(f"[Signal] {incoming_ticker} | target={target_pos} | sig_price={signal_price} | "
+                f"action={order_action} | comment={order_comment} | id={order_id}")
 
     try:
         success, detail = execute_trade_alignment(target_pos, signal_price=signal_price, ticker=incoming_ticker)
         status = "success" if success else "warning"
-        code   = 200
-        return jsonify({"status": status, "detail": str(detail)}), code
+        log_webhook_raw(data, f"EXECUTED:{status}")
+        return jsonify({"status": status, "detail": str(detail)}), 200
     except Exception as e:
         logger.critical(f"[Critical] {e}")
         send_line_notify(f"\n🔥 系統崩潰！\n{e}")
+        log_webhook_raw(data, f"ERROR:{str(e)[:100]}")
         return jsonify({"status": "error", "msg": str(e)}), 500
 
 # ==========================================
