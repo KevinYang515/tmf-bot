@@ -64,12 +64,12 @@ DRY_RUN          = False
 THRESHOLD_1500   = 0.05  # |NQ%| > 0.05%
 THRESHOLD_0845   = 0.5
 
-# v3 (2026-06-25): 0845 加 KOSPI 第二訊號 — backtest 顯示 |KOSPI 前收|>0.5%
-# 可額外抓到 ~280 trades (vs NQ-only 55) total +113K (vs +37K), PF 1.45 (NQ-only 1.80)
-# 兩個訊號平行：任一觸發即進場；同向時記為高品質訊號
-# 06/24 style (NQ 偏弱但亞洲市場強) 主要靠這條抓
+# v3 (2026-06-25): 0845 加 KOSPI 第二訊號
+# ⚠️ HOTFIX 2026-06-25 01:00: 暫停啟用 — 用「KOSPI 前日收」會 14hr 滯後
+# 06/24 case 證實會反向 (06/23 KOSPI 熔斷 -10%, 但 06/24 早上 KOSPI 反彈 → TX gap up)
+# 等正確的 intraday 08:00→08:44 訊號驗證完才開啟
 THRESHOLD_KOSPI_0845 = 0.5  # |KOSPI 前收 close-to-close %| > 0.5%
-ENABLE_KOSPI_SIGNAL  = True  # 開關，要關掉就改 False
+ENABLE_KOSPI_SIGNAL  = False  # ★ 暫停 ★
 
 # session-specific TP / Stop
 TP1_TICKS_1500   = 150   # 從 100 → 150
@@ -252,22 +252,29 @@ def fetch_nq_change(session):
 
 def fetch_kospi_change():
     """
-    抓 KOSPI 前一日收盤 vs 前前日收盤的 close-to-close 變化 %
+    抓 KOSPI 前一日 vs 前前一日的 close-to-close 變化 %
+    ⚠️ HOTFIX 2026-06-25: 加 nan 防呆 (yfinance 可能在當日尚未收盤時回傳 NaN row)
     用 yfinance ^KS11
-    （KOSPI 在 TW 14:30 收盤，但 0845 訊號要的是「前一天」收盤 vs 「前前天」）
     返回 (pct, last_close) 或 (None, None)
     """
     try:
         import yfinance as yf
+        import math
         ticker = yf.Ticker("^KS11")
-        # 抓最近 7 天 daily 確保有足夠資料
         df = ticker.history(period="7d", interval="1d", auto_adjust=False)
         if df.empty or len(df) < 2:
             logger.warning("yfinance KOSPI 抓取為空或不足 2 日")
             return None, None
-        # 取最近兩天收盤
+        # 過濾掉 NaN row (當天還沒收盤會回 NaN)
+        df = df[df["Close"].notna() & (df["Close"] > 0)]
+        if len(df) < 2:
+            logger.warning(f"yfinance KOSPI 過濾 NaN 後不足 2 日 (raw rows={len(df)})")
+            return None, None
         last_close = float(df.iloc[-1]["Close"])
         prev_close = float(df.iloc[-2]["Close"])
+        if not (math.isfinite(last_close) and math.isfinite(prev_close)) or prev_close == 0:
+            logger.warning(f"KOSPI close 不合理: last={last_close} prev={prev_close}")
+            return None, None
         pct = (last_close - prev_close) / prev_close * 100
         logger.info(f"[KOSPI Signal] {df.index[-2].strftime('%m-%d')}={prev_close:.2f} "
                     f"-> {df.index[-1].strftime('%m-%d')}={last_close:.2f}  ({pct:+.2f}%)")
