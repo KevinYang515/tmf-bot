@@ -64,6 +64,13 @@ DRY_RUN          = False
 THRESHOLD_1500   = 0.05  # |NQ%| > 0.05%
 THRESHOLD_0845   = 0.5
 
+# v3 (2026-06-25): 0845 加 KOSPI 第二訊號 — backtest 顯示 |KOSPI 前收|>0.5%
+# 可額外抓到 ~280 trades (vs NQ-only 55) total +113K (vs +37K), PF 1.45 (NQ-only 1.80)
+# 兩個訊號平行：任一觸發即進場；同向時記為高品質訊號
+# 06/24 style (NQ 偏弱但亞洲市場強) 主要靠這條抓
+THRESHOLD_KOSPI_0845 = 0.5  # |KOSPI 前收 close-to-close %| > 0.5%
+ENABLE_KOSPI_SIGNAL  = True  # 開關，要關掉就改 False
+
 # session-specific TP / Stop
 TP1_TICKS_1500   = 150   # 從 100 → 150
 TP2_TICKS_1500   = 300   # 從 200 → 300
@@ -240,6 +247,33 @@ def fetch_nq_change(session):
         return pct, c_to
     except Exception as e:
         logger.error(f"[NQ Fetch] {e}")
+        return None, None
+
+
+def fetch_kospi_change():
+    """
+    抓 KOSPI 前一日收盤 vs 前前日收盤的 close-to-close 變化 %
+    用 yfinance ^KS11
+    （KOSPI 在 TW 14:30 收盤，但 0845 訊號要的是「前一天」收盤 vs 「前前天」）
+    返回 (pct, last_close) 或 (None, None)
+    """
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker("^KS11")
+        # 抓最近 7 天 daily 確保有足夠資料
+        df = ticker.history(period="7d", interval="1d", auto_adjust=False)
+        if df.empty or len(df) < 2:
+            logger.warning("yfinance KOSPI 抓取為空或不足 2 日")
+            return None, None
+        # 取最近兩天收盤
+        last_close = float(df.iloc[-1]["Close"])
+        prev_close = float(df.iloc[-2]["Close"])
+        pct = (last_close - prev_close) / prev_close * 100
+        logger.info(f"[KOSPI Signal] {df.index[-2].strftime('%m-%d')}={prev_close:.2f} "
+                    f"-> {df.index[-1].strftime('%m-%d')}={last_close:.2f}  ({pct:+.2f}%)")
+        return pct, last_close
+    except Exception as e:
+        logger.error(f"[KOSPI Fetch] {e}")
         return None, None
 
 
@@ -545,7 +579,7 @@ def cancel_pending_orders():
 # 6. 主邏輯
 # ==========================================
 def handle_signal(session_key):
-    """到了 signal 計算時間，抓 NQ 看是否進場"""
+    """到了 signal 計算時間，抓 NQ (+ 0845 抓 KOSPI) 看是否進場"""
     today_str = now_tp().strftime("%Y-%m-%d")
     done = state["today_signals_done"].setdefault(today_str, [])
     if session_key in done:
@@ -556,15 +590,49 @@ def handle_signal(session_key):
     if pct is None:
         return
 
-    if abs(pct) < threshold:
-        logger.info(f"[Signal {session_key}] |NQ%|={abs(pct):.2f}% < {threshold}% → SKIP")
+    nq_sig = 0
+    if abs(pct) >= threshold:
+        nq_sig = 1 if pct > 0 else -1
+
+    # === 0845 加 KOSPI 第二訊號 ===
+    kospi_sig = 0
+    kospi_pct = None
+    if session_key == "0845" and ENABLE_KOSPI_SIGNAL:
+        kospi_pct, _ = fetch_kospi_change()
+        if kospi_pct is not None and abs(kospi_pct) >= THRESHOLD_KOSPI_0845:
+            kospi_sig = 1 if kospi_pct > 0 else -1
+
+    # 整合方向決策
+    direction = 0
+    trigger_label = ""
+    if nq_sig != 0 and kospi_sig != 0:
+        if nq_sig == kospi_sig:
+            direction = nq_sig
+            trigger_label = "NQ+KOSPI 雙確認 ⭐"
+        else:
+            # 衝突 — 取 NQ (Sharpe 較高)
+            direction = nq_sig
+            trigger_label = "衝突→取 NQ"
+    elif nq_sig != 0:
+        direction = nq_sig
+        trigger_label = "NQ only"
+    elif kospi_sig != 0:
+        direction = kospi_sig
+        trigger_label = "KOSPI only (06/24 style)"
+
+    nq_str = f"NQ={pct:+.2f}%"
+    kospi_str = f" KOSPI={kospi_pct:+.2f}%" if kospi_pct is not None else ""
+    if direction == 0:
+        logger.info(f"[Signal {session_key}] {nq_str}{kospi_str} → SKIP "
+                    f"(NQ 門檻 {threshold}%, KOSPI 門檻 {THRESHOLD_KOSPI_0845}%)")
         done.append(session_key)
         save_state(state)
         return
 
-    direction = 1 if pct > 0 else -1
-    logger.info(f"[Signal {session_key}] |NQ%|={abs(pct):.2f}% >= {threshold}% → {'多' if direction==1 else '空'}")
-    line_notify(f"{session_key} 訊號觸發\nNQ%={pct:+.2f}%\n方向: {'多' if direction==1 else '空'}")
+    logger.info(f"[Signal {session_key}] {nq_str}{kospi_str} → "
+                f"{'多' if direction==1 else '空'}  ({trigger_label})")
+    line_notify(f"{session_key} 訊號觸發\n{nq_str}{kospi_str}\n"
+                f"方向: {'多' if direction==1 else '空'} ({trigger_label})")
 
     # 等到 entry_submit 時間（提早 30 秒預掛）
     _, entry_submit_t, opening_t, _ = SIGNAL_CHECK_TIMES[session_key]
