@@ -64,12 +64,14 @@ DRY_RUN          = False
 THRESHOLD_1500   = 0.05  # |NQ%| > 0.05%
 THRESHOLD_0845   = 0.5
 
-# v3 (2026-06-25): 0845 加 KOSPI 第二訊號
-# ⚠️ HOTFIX 2026-06-25 01:00: 暫停啟用 — 用「KOSPI 前日收」會 14hr 滯後
-# 06/24 case 證實會反向 (06/23 KOSPI 熔斷 -10%, 但 06/24 早上 KOSPI 反彈 → TX gap up)
-# 等正確的 intraday 08:00→08:44 訊號驗證完才開啟
-THRESHOLD_KOSPI_0845 = 0.5  # |KOSPI 前收 close-to-close %| > 0.5%
-ENABLE_KOSPI_SIGNAL  = False  # ★ 暫停 ★
+# v4 (2026-06-26): 0845 用 KOSPI 當 V0 filter (非獨立訊號)
+# Backtest 2024-01~2026-06 (V0_kc_strict):
+#   n=24, total +28,002, EV +1,167, WR 70.8%, Sharpe +7.43, PF 2.52, maxDD -3,724
+#   vs baseline V0 n=38 Sharpe +3.33 PF 1.57
+#   by half-year 5/5 期正 EV
+# 規則: NQ |%|>0.5% AND KOSPI 同向 AND |KOSPI gap|>0.3% (intraday 08:00 TW open vs 前日 close)
+ENABLE_V4_FILTER     = True   # ★ V4 上線 ★
+THRESHOLD_KOSPI_0845 = 0.3    # KOSPI gap 同向確認門檻 (>0.3%)
 
 # session-specific TP / Stop
 TP1_TICKS_1500   = 150   # 從 100 → 150
@@ -250,35 +252,47 @@ def fetch_nq_change(session):
         return None, None
 
 
-def fetch_kospi_change():
+def fetch_kospi_open_gap():
     """
-    抓 KOSPI 前一日 vs 前前一日的 close-to-close 變化 %
-    ⚠️ HOTFIX 2026-06-25: 加 nan 防呆 (yfinance 可能在當日尚未收盤時回傳 NaN row)
-    用 yfinance ^KS11
-    返回 (pct, last_close) 或 (None, None)
+    v4: 用 5m intraday bar 抓 KOSPI 今日 08:00 TW 開盤 vs 前日最後 close
+    (KOSPI 開盤 = 09:00 KR = 08:00 TW, 在 TX 08:44 cutoff 前 44min)
+
+    回傳 (gap_pct, today_open) 或 (None, None)
     """
     try:
         import yfinance as yf
         import math
-        ticker = yf.Ticker("^KS11")
-        df = ticker.history(period="7d", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 2:
-            logger.warning("yfinance KOSPI 抓取為空或不足 2 日")
+        df = yf.Ticker("^KS11").history(period="5d", interval="5m", auto_adjust=False)
+        if df.empty:
+            logger.warning("yfinance KOSPI 5m 抓取為空")
             return None, None
-        # 過濾掉 NaN row (當天還沒收盤會回 NaN)
+        df.index = df.index.tz_convert(TAIPEI)
         df = df[df["Close"].notna() & (df["Close"] > 0)]
-        if len(df) < 2:
-            logger.warning(f"yfinance KOSPI 過濾 NaN 後不足 2 日 (raw rows={len(df)})")
+        if df.empty:
+            logger.warning("yfinance KOSPI 過濾 NaN 後為空")
             return None, None
-        last_close = float(df.iloc[-1]["Close"])
-        prev_close = float(df.iloc[-2]["Close"])
-        if not (math.isfinite(last_close) and math.isfinite(prev_close)) or prev_close == 0:
-            logger.warning(f"KOSPI close 不合理: last={last_close} prev={prev_close}")
+
+        today = now_tp().date()
+        today_bars = df[df.index.date == today]
+        if today_bars.empty:
+            logger.warning(f"KOSPI 今日({today}) 還沒有 5m bar — 可能未到 08:00 TW or 假日")
             return None, None
-        pct = (last_close - prev_close) / prev_close * 100
-        logger.info(f"[KOSPI Signal] {df.index[-2].strftime('%m-%d')}={prev_close:.2f} "
-                    f"-> {df.index[-1].strftime('%m-%d')}={last_close:.2f}  ({pct:+.2f}%)")
-        return pct, last_close
+        today_open = float(today_bars.iloc[0]["Open"])
+
+        prev_bars = df[df.index.date < today]
+        if prev_bars.empty:
+            logger.warning("KOSPI 前日 bar 缺")
+            return None, None
+        prev_close = float(prev_bars.iloc[-1]["Close"])
+
+        if not math.isfinite(today_open) or not math.isfinite(prev_close) or prev_close <= 0:
+            logger.warning(f"KOSPI 價格不合理: today_open={today_open} prev_close={prev_close}")
+            return None, None
+
+        gap_pct = (today_open - prev_close) / prev_close * 100
+        logger.info(f"[KOSPI 5m] prev_close@{prev_bars.index[-1].strftime('%m-%d %H:%M')}={prev_close:.2f} "
+                    f"-> today_open@{today_bars.index[0].strftime('%H:%M')}={today_open:.2f}  ({gap_pct:+.3f}%)")
+        return gap_pct, today_open
     except Exception as e:
         logger.error(f"[KOSPI Fetch] {e}")
         return None, None
@@ -597,49 +611,66 @@ def handle_signal(session_key):
     if pct is None:
         return
 
+    # === NQ 第一道門檻 ===
     nq_sig = 0
     if abs(pct) >= threshold:
         nq_sig = 1 if pct > 0 else -1
 
-    # === 0845 加 KOSPI 第二訊號 ===
-    kospi_sig = 0
+    # === v4: 0845 加 KOSPI filter (V0_kc_strict) ===
+    direction = nq_sig
     kospi_pct = None
-    if session_key == "0845" and ENABLE_KOSPI_SIGNAL:
-        kospi_pct, _ = fetch_kospi_change()
-        if kospi_pct is not None and abs(kospi_pct) >= THRESHOLD_KOSPI_0845:
-            kospi_sig = 1 if kospi_pct > 0 else -1
-
-    # 整合方向決策
-    direction = 0
     trigger_label = ""
-    if nq_sig != 0 and kospi_sig != 0:
-        if nq_sig == kospi_sig:
-            direction = nq_sig
-            trigger_label = "NQ+KOSPI 雙確認 ⭐"
-        else:
-            # 衝突 — 取 NQ (Sharpe 較高)
-            direction = nq_sig
-            trigger_label = "衝突→取 NQ"
-    elif nq_sig != 0:
-        direction = nq_sig
-        trigger_label = "NQ only"
-    elif kospi_sig != 0:
-        direction = kospi_sig
-        trigger_label = "KOSPI only (06/24 style)"
+    if session_key == "0845" and ENABLE_V4_FILTER:
+        if nq_sig == 0:
+            # NQ 不過門檻直接退 — 不浪費 yfinance call
+            logger.info(f"[Signal {session_key}] NQ={pct:+.2f}% < {threshold}% → SKIP (NQ 門檻)")
+            done.append(session_key)
+            save_state(state)
+            return
 
-    nq_str = f"NQ={pct:+.2f}%"
-    kospi_str = f" KOSPI={kospi_pct:+.2f}%" if kospi_pct is not None else ""
+        kospi_pct, kospi_open = fetch_kospi_open_gap()
+        if kospi_pct is None:
+            logger.warning(f"[Signal {session_key}] NQ 過門檻但 KOSPI 取不到 → SKIP (V4 規定)")
+            line_notify(f"{session_key} V4 訊號:NQ={pct:+.2f}% 過但 KOSPI 缺資料, SKIP")
+            done.append(session_key)
+            save_state(state)
+            return
+
+        if abs(kospi_pct) < THRESHOLD_KOSPI_0845:
+            logger.info(f"[Signal {session_key}] NQ={pct:+.2f}% / KOSPI={kospi_pct:+.3f}% "
+                        f"< {THRESHOLD_KOSPI_0845}% → SKIP (KOSPI 確認太弱)")
+            done.append(session_key)
+            save_state(state)
+            return
+
+        kospi_sig = 1 if kospi_pct > 0 else -1
+        if kospi_sig != nq_sig:
+            logger.info(f"[Signal {session_key}] NQ={pct:+.2f}% / KOSPI={kospi_pct:+.3f}% "
+                        f"反向 → SKIP (V4 filter)")
+            line_notify(f"{session_key} V4: NQ/KOSPI 反向, SKIP\n"
+                        f"NQ={pct:+.2f}% KOSPI={kospi_pct:+.3f}%")
+            done.append(session_key)
+            save_state(state)
+            return
+
+        trigger_label = " (V4 NQ+KOSPI 同向 ✓)"
+        logger.info(f"[Signal {session_key}] NQ={pct:+.2f}% + KOSPI={kospi_pct:+.3f}% "
+                    f"同向 → {'多' if direction==1 else '空'}{trigger_label}")
+
+    # 非 0845 或 V4 關閉: 純 NQ 邏輯
     if direction == 0:
-        logger.info(f"[Signal {session_key}] {nq_str}{kospi_str} → SKIP "
-                    f"(NQ 門檻 {threshold}%, KOSPI 門檻 {THRESHOLD_KOSPI_0845}%)")
+        logger.info(f"[Signal {session_key}] |NQ%|={abs(pct):.2f}% < {threshold}% → SKIP")
         done.append(session_key)
         save_state(state)
         return
 
-    logger.info(f"[Signal {session_key}] {nq_str}{kospi_str} → "
-                f"{'多' if direction==1 else '空'}  ({trigger_label})")
-    line_notify(f"{session_key} 訊號觸發\n{nq_str}{kospi_str}\n"
-                f"方向: {'多' if direction==1 else '空'} ({trigger_label})")
+    if not trigger_label:
+        logger.info(f"[Signal {session_key}] |NQ%|={abs(pct):.2f}% >= {threshold}% → "
+                    f"{'多' if direction==1 else '空'}")
+
+    line_notify(f"{session_key} 訊號觸發\nNQ%={pct:+.2f}%" +
+                (f"\nKOSPI={kospi_pct:+.3f}%" if kospi_pct is not None else "") +
+                f"\n方向: {'多' if direction==1 else '空'}{trigger_label}")
 
     # 等到 entry_submit 時間（提早 30 秒預掛）
     _, entry_submit_t, opening_t, _ = SIGNAL_CHECK_TIMES[session_key]
@@ -799,8 +830,9 @@ def reset_daily_state_if_new_day():
 # ==========================================
 def main():
     logger.info(f"=== NQ Strategy 啟動 ===")
+    v4_str = f"  V4 filter: 0845 KOSPI 同向 |%|>{THRESHOLD_KOSPI_0845}% ★" if ENABLE_V4_FILTER else ""
     logger.info(f"配置 v2(B)：1500 TP +{TP1_TICKS_1500}/+{TP2_TICKS_1500} stop=-{STOP_TICKS_1500}  | "
-                f"0845 TP +{TP1_TICKS_0845}/+{TP2_TICKS_0845} stop=-{STOP_TICKS_0845}")
+                f"0845 TP +{TP1_TICKS_0845}/+{TP2_TICKS_0845} stop=-{STOP_TICKS_0845}{v4_str}")
     logger.info(f"門檻：1500 |NQ%|>{THRESHOLD_1500}% / 0845 |NQ%|>{THRESHOLD_0845}%")
 
     login_shioaji()
