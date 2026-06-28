@@ -115,14 +115,29 @@ for 每檔候選股:
 | 模擬交易 | XQ 內建 | Shioaji simulation 模式 |
 | 開發風險 | 我對 XS 語法不熟 (寫的有 TODO 待驗證) | 我較熟，但少數 API 細節仍待測 |
 
-### XS 語法注意事項
-寫的 `.xs` 腳本根據通用 XS / TradeStation EasyLanguage 知識撰寫，**真實上線前必驗**：
-- `ShortNextBar` / `BuyToCoverNextBar` 函數名稱是否正確
-- 現股當沖 vs 借券放空的 order routing 在 XQ 怎麼設定
-- Tick size 用 0.05 是 50 元股，高價股要動態算
-- 自動交易中心的 "N_MAX" 限制怎麼設
+### XS 語法注意事項 (2026-06-28 更新)
+讀完 XQ 官方教學後修正:
 
-建議先寫信去 XQ 客服或在 XQ 社群問這幾個問題。
+| 元素 | 我之前寫錯 | XQ 正確語法 |
+|---|---|---|
+| 進場 short | `ShortNextBar(...)` | `SetPosition(-qty, price)` 或 `Short(...)` |
+| 平倉 | `BuyToCoverNextBar(...)` | `SetPosition(0, price)` |
+| 前一日收盤 | `close[1] of data2` | `CloseD(1)` |
+| 部位查詢 | `MarketPosition` | `Position` (目標), `Filled` (實際成交) |
+| 警示 | OK | `Alert(...)` |
+
+我用上面修正後的語法重寫了 `XQ_守不住開盤_auto.xs`,
+但仍有部分細節需在 XQ 編輯器內驗證 (見腳本底部 TODO):
+
+1. **SetPosition 的價格參數位置** — XQ 範例只有 `SetPosition(1, MARKET)` 或 `SetPosition(0, addspread(close,+2))`, 沒有 short 用例
+2. **tick size 不能 hardcode** — 50元股 0.05, 500元股 0.5, 1000+元股 5.0
+3. **Time format** — 是 HHMM(900) 還是 HHMMSS(90000)?
+4. **floor / MinValue** — 是否內建
+
+建議:
+1. 把 `.xs` 貼到 XQ 編輯器, 看編輯器標紅哪些
+2. 紅線回貼給我, 我修正
+3. 跑模擬交易 1-2 週驗證邏輯是否正確
 
 ## Live trade log 格式
 
