@@ -92,14 +92,37 @@ for 每檔候選股:
 所有未平倉部位 → 市價 IOC 平倉
 ```
 
-## XQ Script 半自動版
+## XQ 自動下單版 (推薦給有 XQ + 高額度的人)
 
-如果 Shioaji API 等不及/額度不夠，先用 XQ Script 警示：
-1. 把 `XQ_守不住開盤_警示.xs` import 到 XQ
-2. 開盤後自動 monitor 警示
-3. 觸發時手動下單 + 手動掛智慧停損
+⚠️ **修正之前的錯誤資訊**: XQ 確實能做全自動下單（透過「自動交易中心」），不只是警示。
 
-**缺點**：XS 不能自動下單和 trail，trail 的 alpha 損失（Sharpe 28 → 22 估計）。
+### XQ 部署流程
+1. 每日 08:50 cron 跑 `XQ_守不住開盤_選股.xs` → 自動產生候選股觀察清單
+2. 把 `XQ_守不住開盤_auto.xs` 設定到觀察清單所有股票（XQ 自動交易中心）
+3. 自動交易中心設定：**最大同時部位 5 檔**（= N_MAX）
+4. 串接券商帳號 (口袋 / 國泰 / 永豐, 看 XQ 支援哪家)
+5. 啟動「模擬交易」先驗證 1-2 週
+6. 通過後切到實盤
+
+### XQ vs Shioaji 對照
+
+| 項目 | XQ Script | Shioaji |
+|---|---|---|
+| 語言 | XS (BASIC-like) | Python |
+| 額度限制 | 看串接券商 (口袋/國泰 2000萬) | 永豐 (你目前只有 50萬) |
+| Trail stop | XS 內手寫 (可實現但需驗證) | Python loop 控制 (我較熟) |
+| Top-5 排序 | 用「自動交易中心」最大部位限制 | Python 邏輯選 top-5 |
+| 模擬交易 | XQ 內建 | Shioaji simulation 模式 |
+| 開發風險 | 我對 XS 語法不熟 (寫的有 TODO 待驗證) | 我較熟，但少數 API 細節仍待測 |
+
+### XS 語法注意事項
+寫的 `.xs` 腳本根據通用 XS / TradeStation EasyLanguage 知識撰寫，**真實上線前必驗**：
+- `ShortNextBar` / `BuyToCoverNextBar` 函數名稱是否正確
+- 現股當沖 vs 借券放空的 order routing 在 XQ 怎麼設定
+- Tick size 用 0.05 是 50 元股，高價股要動態算
+- 自動交易中心的 "N_MAX" 限制怎麼設
+
+建議先寫信去 XQ 客服或在 XQ 社群問這幾個問題。
 
 ## Live trade log 格式
 
