@@ -1,43 +1,19 @@
 // ============================================================
-// 守不住開盤 V8 — XQ 盤前選股 (Stock Screener)
+// 守不住開盤 V8 — XQ 盤前選股 v5
 // ============================================================
 //
-// 部署:
-//   1. 把這支腳本「加入選股」(XQ → 選股工具 → 自訂選股)
-//   2. 設定執行時間: 每日 08:50 自動更新
-//   3. 選股結果自動更新一個「觀察清單」
-//   4. 把 XQ_守不住開盤_auto.xs 設定在這個觀察清單的所有股票
-//
-// 篩選邏輯:
-//   - 開盤 gap up 0.5% ~ 10% (vs 前一日收盤)
-//   - 當日量 >= 20 日均量 * 1.0
-//
-// 注意:
-//   - 這個腳本要在開盤後才能準確篩 gap (因為要看當日 open)
-//   - 第一筆 1-min K 通常 09:01:00 才有 → 建議 09:02 執行
+// v4→v5:
+//   用 OpenD(0)/CloseD(1) 明確參照日K，避免被 1分K context 誤解
+//   condition2 暫時移除（在 1分K context 下 volume/average 不穩定）
+//   condition3 改用 CloseD(1)（昨收）判斷股價範圍，確保日K context
 // ============================================================
 
-// 條件 1: gap up 0.5% ~ 10%
-condition1: open of data2 / close[1] of data2 - 1 >= 0.005
-        and open of data2 / close[1] of data2 - 1 <= 0.10;
+// 條件 1: 今日開盤 vs 昨收 Gap up 0.5% ~ 10%（明確日K）
+condition1 = OpenD(0) / CloseD(1) - 1 >= 0.005
+         and OpenD(0) / CloseD(1) - 1 <= 0.10;
 
-// 條件 2: 當日量大 (代表有人氣)
-//   用前一日量比較 (前一日量 > 20 日均量) 作為流動性 proxy
-condition2: volume[1] of data2 >= average(volume of data2, 20)[1];
+// 條件 2: 昨收股價 30–1000（排除極低/極高價）
+condition2 = CloseD(1) >= 30 and CloseD(1) <= 1000;
 
-// 排除過小型股 (避免流動性問題)
-condition3: average(close of data2, 5) >= 30   // 平均股價 30 元以上
-        and average(close of data2, 5) <= 1500;  // 排除過高價 (買不起 1 張)
-
-// 排除 ETF / 特殊代號
-condition4: not (Symbol[1] = "0" or Symbol[1] = "1");  // 簡單避開 ETF 0050 等
-
-// 全部條件滿足才入選
-filter = condition1 and condition2 and condition3 and condition4;
-
-// ============================================================
-// ⚠️ XS 語法 verification:
-//   - data2 是日線 (XQ 預設 data1 = 分線 / 設定的 timeframe; data2 = 日線)
-//   - average() 是內建 SMA
-//   - Symbol[1] 取第一個字元 (是否如此語法待驗證)
-// ============================================================
+// 條件 3: 排除 ETF（代號首字 0）
+condition3 = LeftStr(Symbol, 1) <> "0";

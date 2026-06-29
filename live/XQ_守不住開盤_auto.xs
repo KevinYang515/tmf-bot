@@ -1,137 +1,188 @@
 // ============================================================
-// 守不住開盤 V8 — XQ Script 自動下單版 (修正版 v2)
+// 守不住開盤 V8 — XQ 策略腳本 v4.6
 // ============================================================
+// ⚠️  必須建立為「策略」類型 (Position/SetPosition/MARKET 才有效)
+//     XQ → 自動交易中心 → 交易策略 → 新增策略腳本
 //
-// ⚠️ 重要前置說明
-// 此腳本根據 XQ 官方文件已知語法撰寫，但有以下不確定處需在 XQ 編輯器內驗證：
-//   - SetPosition 完整參數簽名
-//   - Short / Cover 函數的具體用法
-//   - CloseD(N) 取前 N 日收盤
-//   - 觸發停損的最佳寫法
-//
-// 強烈建議:
-//   1. 用 XQ XS 編輯器開新腳本
-//   2. 把這個邏輯複製進去，編輯器會自動 syntax check
-//   3. 若有紅線，貼到 ChatGPT / 我，幫你修正
-//
-// 部署:
-//   1. 每日 08:50 用 XQ_守不住開盤_選股.xs 篩選 gap up 候選股
-//   2. 把這個策略 attach 到候選股觀察清單
-//   3. 自動交易中心: 最大部位 = 5 (= N_MAX)
-//   4. 模擬交易跑 1-2 週驗證後再切實盤
+// v4.4→v4.5:
+//   BUG FIX: Trail stop 不應在進場當根 bar 執行（Python 從 entry_bar 的下一根才開始）
+//   加 JustEntered 旗標：進場當根設 1，下一根 bar 開頭重設 0
+//   Trail stop 順序改回與 Python 一致：先 UPDATE RunningLow，再 CHECK High（UPDATE→CHECK）
+//   原始順序才正確：先更新 running_low，再判斷 High >= cur_stop
 // ============================================================
 
-// ── 策略參數 (input 讓使用者可在 GUI 調) ──
-input: WaitMin(35);              // 09:35 開始監看
-input: EndMin(37);               // 09:37 截止
-input: EntryPct(0.0005);         // 從 morning_high 回落 0.05%
-input: AorMaxPct(0.030);         // stock_aor 上限 3.0%
-input: MhToLimitMin(0.010);      // mh_to_limit 下限 1.0%
-input: GapMin(0.005);            // gap_pct 下限
-input: GapMax(0.10);             // gap_pct 上限
-input: PositionDollar(1000000);  // 單檔部位金額 100 萬
-input: ForceExitTime(1130);      // 11:30 強平
+// v4.5→v4.6:
+//   BUG FIX: SetPosition(0, CurrentStop) 立即把 Position 設為 0（即使限價單未成交）
+//            導致 11:30 強平 (Position <> 0) 看不到殘留部位 → 隔夜未平倉
+//   Trail stop 出場改用限價 SetPosition(0, CurrentStop)，對齊 Python exit_price = cur_stop
+//   Trail stop 條件改為 Position < 0（SetPosition 後 Position 馬上歸零，自然只觸發一次）
+//   11:30 強平改用 Filled <> 0（偵測實際未成交部位），SetPosition(0, MARKET) 強制覆蓋限價單
+// ── 策略參數 ─────────────────────────────────────────────
+input: EntryPct(0.0005);        // 從 MorningHigh 回落 0.05%
+input: AorMaxPct(0.030);        // 早盤振幅上限 3%
+input: MhToLimitMin(0.010);     // 距漲停至少 1%
+input: GapMin(0.005);           // Gap up 下限 0.5%
+input: GapMax(0.10);            // Gap up 上限 10%
+input: PositionDollar(1000000); // 每檔預算 100 萬
 
-// ── 狀態變數 ──
-var: MorningHigh(0), DayOpen(0), PrevClose(0);
-var: GapPct(0), Aor(0), MhToLimit(0), TriggerPrice(0), LimitPrice(0);
-var: HasEntry(false), EntryPrice(0), EntryQty(0);
-var: RunningLow(0), CurrentStop(0);
+// ── 狀態變數 ─────────────────────────────────────────────
+var: MorningHigh(0);
+var: DayOpen(0);
+var: PrevClose(0);
+var: LimitPrice(0);
+var: GapPct(0);
+var: Aor(0);
+var: MhToLimit(0);
+var: TriggerPrice(0);
+var: HasEntry(0);       // 0=未進場, 1=已進場
+var: JustEntered(0);   // 進場當根 bar=1，下一根 bar 開頭重設 0（trail stop 跳過進場 bar）
+var: EntryPx(0);
+var: EntryLots(0);
+var: RunningLow(0);
+var: CurrentStop(0);
+var: CurTickSize(0);
+var: StopCand(0);
+var: InWindow(0);
+var: TrigOK(0);
+var: GapOK(0);
+var: BarsFromOpen(0);  // [D3] 每日 Bar 計數 (1=09:00, 36=09:35, 151=11:30)
 
-// ── 取得前一日收盤 (XS 內建 CloseD) ──
-PrevClose = CloseD(1);    // 1 = 前一日
+// ── 每 Bar 最開頭：重設進場旗標 ──────────────────────────
+if JustEntered > 0 then JustEntered = 0;
 
-// ── 第一筆 K = 開盤價 ──
-if Time = 900 and DayOpen = 0 and open > 0 then begin
-    DayOpen = open;
-    if PrevClose > 0 then GapPct = (DayOpen - PrevClose) / PrevClose;
-    LimitPrice = round(PrevClose * 1.10, 2);
+// ══════════════════════════════════════════════════════════
+// ① 隔日重置 + 開盤初始化  [D1/D2: 合併，避免 Time 格式問題]
+//    Date <> Date[1] = 每日第一根 Bar，Open 即是開盤價
+// ══════════════════════════════════════════════════════════
+if Date <> Date[1] then begin
+    MorningHigh  = 0;
+    DayOpen      = 0;
+    GapPct       = 0;
+    LimitPrice   = 0;
+    HasEntry     = 0;
+    JustEntered  = 0;
+    EntryPx      = 0;
+    EntryLots    = 0;
+    RunningLow   = 0;
+    CurrentStop  = 0;
+    GapOK        = 0;
+    InWindow     = 0;
+    TrigOK       = 0;
+    BarsFromOpen = 0;
+
+    // 第一根 Bar 的 Open = 開盤價，直接取 (不依賴 Time 格式)
+    PrevClose  = CloseD(1);
+    if Open > 0 and PrevClose > 0 then begin
+        DayOpen    = Open;
+        GapPct     = (DayOpen - PrevClose) / PrevClose;
+        LimitPrice = PrevClose * 1.10;
+    end;
+
+    // [D4] 診斷 Alert: 確認 Time 格式 / CloseD / Gap 計算
+    // 看執行 tab 的 Alert 輸出，T= 那個值就是 XQ 的 Time 格式
+    Alert("INIT|" + Symbol + "|T=" + NumToStr(Time, 0) + "|O=" + NumToStr(DayOpen, 2) + "|PC=" + NumToStr(PrevClose, 2) + "|Gap=" + NumToStr(GapPct * 100, 2) + "%");
 end;
 
-// ── Gap 範圍 filter (不符合就 exit 該根 K 處理) ──
-if GapPct < GapMin or GapPct > GapMax then exit;
+// ── 每 Bar 計數 ──────────────────────────────────────────
+BarsFromOpen = BarsFromOpen + 1;
 
-// ── 09:00 - 09:35 累積 morning_high ──
-if Time >= 900 and Time < (900 + WaitMin) then begin
-    if high > MorningHigh then MorningHigh = high;
+// ══════════════════════════════════════════════════════════
+// ② Gap 篩選
+// ══════════════════════════════════════════════════════════
+GapOK = 0;
+if DayOpen > 0 and GapPct >= GapMin and GapPct <= GapMax then GapOK = 1;
+
+// ══════════════════════════════════════════════════════════
+// ③ 09:00-09:34 累積 MorningHigh  [D3: Bar 1-35]
+// ══════════════════════════════════════════════════════════
+if GapOK > 0 and BarsFromOpen >= 1 and BarsFromOpen <= 35 then begin
+    if High > MorningHigh then MorningHigh = High;
 end;
 
-// ── 09:35 - 09:37 trigger detection + 進場 ──
-if Time >= (900 + WaitMin) and Time <= (900 + EndMin)
-   and not HasEntry and MorningHigh > 0 and DayOpen > 0 then begin
+// ══════════════════════════════════════════════════════════
+// ④ 動態 Tick Size
+// ══════════════════════════════════════════════════════════
+if Close < 10 then CurTickSize = 0.01;
+if Close >= 10 and Close < 50 then CurTickSize = 0.05;
+if Close >= 50 and Close < 100 then CurTickSize = 0.10;
+if Close >= 100 and Close < 500 then CurTickSize = 0.50;
+if Close >= 500 and Close < 1000 then CurTickSize = 1.00;
+if Close >= 1000 then CurTickSize = 5.00;
 
-    Aor = (MorningHigh / DayOpen - 1);
-    MhToLimit = (LimitPrice - MorningHigh) / MorningHigh;
-    TriggerPrice = round(MorningHigh * (1 - EntryPct), 2);
+// ══════════════════════════════════════════════════════════
+// ⑤ 09:35-09:36 觸發偵測 + 進場  [D3: Bar 36-37]
+// ══════════════════════════════════════════════════════════
+InWindow = 0;
+if GapOK > 0 and BarsFromOpen >= 36 and BarsFromOpen <= 37 then InWindow = 1;
 
-    // V8 全部 filter
-    if Aor < AorMaxPct and MhToLimit >= MhToLimitMin and low <= TriggerPrice then begin
+if InWindow > 0 and HasEntry < 1 and MorningHigh > 0 then begin
 
-        EntryQty = floor(PositionDollar / (TriggerPrice * 1000));
-        if EntryQty >= 1 then begin
-            // 進場 SHORT
-            // XQ 推薦寫法: SetPosition(-1, ...) target 是負部位
-            // 或: Short(qty, price, "Limit")
-            // ⚠️ 真實語法請在 XQ 編輯器內驗證
-            SetPosition(-EntryQty, TriggerPrice);   // 預設限價
+    Aor          = MorningHigh / DayOpen - 1;
+    MhToLimit    = (LimitPrice - MorningHigh) / MorningHigh;
+    TriggerPrice = MorningHigh * (1 - EntryPct);
 
-            EntryPrice = TriggerPrice;
-            HasEntry = true;
-            RunningLow = TriggerPrice;
-            CurrentStop = MinValue(MorningHigh + 0.05,     // 1 tick (要動態算)
-                                    LimitPrice - 0.05);
+    TrigOK = 0;
+    if Aor < AorMaxPct and MhToLimit >= MhToLimitMin and Low <= TriggerPrice then TrigOK = 1;
 
-            Alert("ENTRY " + Symbol + " short " + Text(EntryQty) +
-                  "張 @" + Text(TriggerPrice) +
-                  " stop=" + Text(CurrentStop));
+    if TrigOK > 0 then begin
+        EntryLots = IntPortion(PositionDollar / (TriggerPrice * 1000));
+
+        if EntryLots >= 1 then begin
+            CurrentStop = MorningHigh + CurTickSize;
+            StopCand    = LimitPrice  - CurTickSize;
+            if StopCand < CurrentStop then CurrentStop = StopCand;
+
+            EntryPx      = TriggerPrice;
+            RunningLow   = TriggerPrice;
+            HasEntry     = 1;
+            JustEntered  = 1;   // 本 bar 不執行 trail stop，下一根 bar 才開始
+
+            SetPosition(-EntryLots, TriggerPrice);
+
+            Alert("ENTRY|" + Symbol + "|Bar=" + NumToStr(BarsFromOpen, 0) + "|" + NumToStr(EntryLots, 0) + "z|@" + NumToStr(TriggerPrice, 2) + "|aor=" + NumToStr(Aor * 100, 2) + "%|stop=" + NumToStr(CurrentStop, 2));
         end;
     end;
 end;
 
-// ── 進場後: Trail stop 邏輯 ──
-if HasEntry and Position = -EntryQty then begin
+// ══════════════════════════════════════════════════════════
+// ⑥ Trail Stop  [v4.5: JustEntered 防護 + UPDATE→CHECK 順序（與 Python 一致）]
+//    Python 邏輯: after = bars strictly AFTER entry bar
+//      for bar in after:
+//        if bar.Low < running_low: update running_low, cur_stop  ← 先 UPDATE
+//        if bar.High >= cur_stop: exit at cur_stop               ← 後 CHECK
+//    JustEntered = 1 讓進場當根 bar 跳過，下一根才開始執行
+// ══════════════════════════════════════════════════════════
+if HasEntry > 0 and JustEntered < 1 and Position < 0 then begin
 
-    // 新低 → trail stop 下移 (running_low + 1 tick)
-    if low < RunningLow then begin
-        RunningLow = low;
-        CurrentStop = MinValue(RunningLow + 0.05,
-                                LimitPrice - 0.05);
+    // Step 1 (UPDATE): 更新 RunningLow → 壓低 CurrentStop（鎖獲利）
+    if Low < RunningLow then begin
+        RunningLow  = Low;
+        CurrentStop = RunningLow + CurTickSize;
+        StopCand    = LimitPrice - CurTickSize;
+        if StopCand < CurrentStop then CurrentStop = StopCand;
     end;
 
-    // ⚠️ 高點突破 CurrentStop → 觸發停損 (回補)
-    if high >= CurrentStop then begin
-        SetPosition(0, CurrentStop);   // 目標部位 0 = 平倉
-        Alert("TRAIL EXIT " + Symbol + " @" + Text(CurrentStop));
+    // Step 2 (CHECK): 判斷當根 High 是否觸及（已更新的）CurrentStop
+    if High >= CurrentStop then begin
+        SetPosition(0, CurrentStop);   // 限價補回，對齊 Python 的 exit_price = cur_stop
+        Alert("TRAIL|" + Symbol + "|stop=" + NumToStr(CurrentStop, 2));
     end;
+
 end;
 
-// ── 11:30 強制平倉 ──
-if HasEntry and Position <> 0 and Time >= ForceExitTime then begin
-    SetPosition(0, Market);             // 市價回補
-    Alert("TIME EXIT " + Symbol + " @market");
-end;
-
-// ── 隔日重置 (用日期變化判斷) ──
-if Date <> Date[1] then begin
-    MorningHigh = 0;
-    DayOpen = 0;
-    GapPct = 0;
-    HasEntry = false;
-    EntryPrice = 0;
-    EntryQty = 0;
-    RunningLow = 0;
-    CurrentStop = 0;
+// ══════════════════════════════════════════════════════════
+// ⑦ 11:30 強平  [D3: Bar 151 = 09:00+150min = 11:30]
+// ══════════════════════════════════════════════════════════
+if HasEntry > 0 and Filled <> 0 and BarsFromOpen >= 151 then begin
+    SetPosition(0, MARKET);
+    Alert("TIMEEXIT|" + Symbol + "|Bar=" + NumToStr(BarsFromOpen, 0));
 end;
 
 // ============================================================
-// ⚠️ 待 XQ 編輯器驗證的細節
-// 1. SetPosition 的價格參數: 直接傳 price 還是 (price, "Limit"/"Market")?
-// 2. Short / Cover 是不是 SetPosition 之外的替代寫法?
-// 3. tick size 0.05 hardcoded 是錯的, 高價股不對 (要寫 GetTickSize())
-// 4. Alert 是否支援字串接 (用 + 還是 ,)
-// 5. floor() 是否內建 (或要用 int())
-// 6. MinValue() 是否內建
-// 7. CloseD(1) 是否就是前一日收盤
-// 8. Time 格式 (HHMM 還是 HHMMSS)
-// 9. 現股當沖 / 借券放空: 在 XQ 自動交易中心設定, 腳本內不需處理
+// ⚠️  VERIFY LIST (若還有紅線)
+// ============================================================
+// IntPortion(x) → 若紅線改 Floor(x)
+// MARKET        → 若紅線改 Market
+// NumToStr(n,d) → 若紅線改 Text(n)
+// CloseD(1)     → 若紅線改 Close[1] of data2
 // ============================================================
