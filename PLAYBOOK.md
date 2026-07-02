@@ -1,10 +1,22 @@
 # TMF 自動交易系統 Playbook
 
-> 最後更新：2026-06-23（V38 vs TV 對齊修正 + MXF 升級評估）
+> 最後更新：2026-07-02（Gap Burst 策略上線取代 NQ 策略 + balance_log 修復）
 > 適用：新 session 快速 onboarding、策略回顧、系統維護
 >
 > **相關文件**：
-> - [NQ_TMF_STRATEGY.md](./NQ_TMF_STRATEGY.md) — 第二支獨立策略：用 NQ 訊號交易 TMF（service: `trading-tmf-nq`）
+> - [GAP_STRATEGY.md](./GAP_STRATEGY.md) — **現役第二策略**：試撮跳空 burst scalp（service: `trading-tmf-gap`，paper trade 中）— 接手必讀
+> - [NQ_TMF_STRATEGY.md](./NQ_TMF_STRATEGY.md) — 已退役（2026-07-02 被 gap 策略取代）：NQ 訊號交易 TMF
+
+## ⚡ 2026-07-02 現況速覽（給接手的 session）
+
+| 系統 | 狀態 | 錢 |
+|---|---|---|
+| V38 (trading-app, app.py) | RUNNING，TV webhook 下單 | **實盤** TMF，權益 ~1.16M（07/02 補錢後） |
+| Gap Burst (trading-tmf-gap) | RUNNING，07/02 剛部署 | 模擬（paper trade） |
+| NQ 策略 (trading-tmf-nq) | **已退役** | — |
+| balance_log.csv | ✅ 07/02 修復（06/23~07/01 斷檔：app.py 重寫時誤刪 snapshot thread，已補回） | — |
+
+近期待辦：Gap 策略首次觸發驗證（見 GAP_STRATEGY.md §6）、V38 漏單 root cause（webhook_raw.csv 累積中）、V38 Status.Failed=可委託金額不足（user 已補錢）。
 
 ---
 
