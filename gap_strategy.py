@@ -59,7 +59,7 @@ DRY_RUN        = False   # True = 完全不送單只 log
 POSITION_QTY   = 1
 POINT_VALUE    = 10      # TMF NT$10/pt
 
-# session 參數（tick 級回測定版 2026-07-02）
+# session 參數（tick 級回測定版 2026-07-04，overnight research 更新見 GAP_STRATEGY.md）
 SESSIONS = {
     "0845": {
         "prep_time":    "08:42",      # 主迴圈觸發（分鐘級）
@@ -68,7 +68,8 @@ SESSIONS = {
         "open_time":    "08:45:00",
         "ref_bar_hm":   (5, 0),       # 夜盤收 = 今日 05:00 bar close
         "threshold":    0.5,          # |gap %|
-        "tp":           80,
+        "tp":           80,           # 固定 TP：動態 TP 掃描過(D1~D5)全部更差，gap 越大 MFE 反而略降
+        "tp_dynamic":   None,
         "stop":         30,
         "cap_seconds":  300,
     },
@@ -79,8 +80,11 @@ SESSIONS = {
         "open_time":    "15:00:00",
         "ref_bar_hm":   (13, 45),     # 日盤收 = 今日 13:45 bar close
         "threshold":    0.3,
-        "tp":           100,
-        "stop":         80,
+        "tp":           100,          # tp_dynamic 有值時當地板(lo)
+        # 動態 TP = clip(alpha * |gap_pts|, lo, hi)；gap_pts 用 |fill_price - ref_close|
+        # H1/H2 walk-forward 驗證: 固定TP100 H2 EV+239 -> 動態 H2 EV+299 (n=12 each)，全樣本+251->+281
+        "tp_dynamic":   {"alpha": 0.4, "lo": 100, "hi": 300},
+        "stop":         80,           # 停損維持固定：動態停損掃描(D3)全部更差 worst 大幅惡化
         "cap_seconds":  180,
     },
 }
@@ -137,7 +141,7 @@ CALIB_HEADERS = ["date", "session", "ref_close",
                  "actual_open", "gap_at_decide_pct", "gap_actual_pct",
                  "triggered", "direction"]
 TRADE_HEADERS = ["date", "session", "direction", "ref_close", "trial_price",
-                 "gap_pct", "fill_price", "exit_reason", "exit_price_est",
+                 "gap_pct", "fill_price", "tp_used", "exit_reason", "exit_price_est",
                  "pnl_pt_est", "pnl_twd_est"]
 
 def append_csv(path, headers, row):
@@ -460,7 +464,15 @@ def handle_session(session_key):
             logger.info(f"[{session_key}] 試撮@{st} = {p if p else 'N/A'}")
 
         # 3. 決策
+        # 優先用最後一筆(:50)試撮；若當下剛好收不到，退而用最近一筆有值的快照
+        # (避免單一 tick 瞬斷就整場 SKIP，即使 :30/:40/:45 早有明確讀值)
         trial = trials[-1]
+        if trial is None:
+            for p in reversed(trials[:-1]):
+                if p is not None:
+                    trial = p
+                    logger.warning(f"[{session_key}] 最後一筆試撮缺值，改用較早的快照 {trial:.0f}")
+                    break
         gap_pct = None
         direction = 0
         if trial is not None and ref_close > 0:
@@ -538,7 +550,13 @@ def handle_session(session_key):
         logger.info(f"[{session_key}] Entry Fill = {fill_price:.0f}")
 
         # 6. TP + 停損監控 + 時間上限
-        tp_p = fill_price + direction * cfg["tp"]
+        tp_pts = cfg["tp"]
+        dyn = cfg.get("tp_dynamic")
+        if dyn:
+            gap_pts_now = abs(fill_price - ref_close)
+            tp_pts = min(max(dyn["alpha"] * gap_pts_now, dyn["lo"]), dyn["hi"])
+            logger.info(f"[{session_key}] 動態 TP: gap_pts={gap_pts_now:.0f} -> TP={tp_pts:.0f}")
+        tp_p = fill_price + direction * tp_pts
         stop_p = fill_price - direction * cfg["stop"]
         place_tp_limit(contract, direction, POSITION_QTY, tp_p)
 
@@ -555,7 +573,7 @@ def handle_session(session_key):
             "date": today_str, "session": session_key, "direction": direction,
             "ref_close": ref_close, "trial_price": trial,
             "gap_pct": round(gap_pct, 4),
-            "fill_price": fill_price, "exit_reason": reason,
+            "fill_price": fill_price, "tp_used": round(tp_pts, 1), "exit_reason": reason,
             "exit_price_est": exit_px,
             "pnl_pt_est": round(pnl_pt, 1) if pnl_pt is not None else None,
             "pnl_twd_est": round(pnl_pt * POINT_VALUE * POSITION_QTY, 0) if pnl_pt is not None else None,

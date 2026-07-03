@@ -1,22 +1,29 @@
 # TMF 自動交易系統 Playbook
 
-> 最後更新：2026-07-02（Gap Burst 策略上線取代 NQ 策略 + balance_log 修復）
+> 最後更新：2026-07-04（Gap Burst overnight research pass：門檻/動態TP walk-forward 驗證 + 邏輯修正）
 > 適用：新 session 快速 onboarding、策略回顧、系統維護
 >
 > **相關文件**：
-> - [GAP_STRATEGY.md](./GAP_STRATEGY.md) — **現役第二策略**：試撮跳空 burst scalp（service: `trading-tmf-gap`，paper trade 中）— 接手必讀
+> - [GAP_STRATEGY.md](./GAP_STRATEGY.md) — **現役第二策略**：試撮跳空 burst scalp（service: `trading-tmf-gap`，paper trade 中）— 接手必讀，§3.1 是 07/04 overnight research 完整記錄
 > - [NQ_TMF_STRATEGY.md](./NQ_TMF_STRATEGY.md) — 已退役（2026-07-02 被 gap 策略取代）：NQ 訊號交易 TMF
 
-## ⚡ 2026-07-02 現況速覽（給接手的 session）
+## ⚡ 2026-07-04 現況速覽（給接手的 session）
 
 | 系統 | 狀態 | 錢 |
 |---|---|---|
 | V38 (trading-app, app.py) | RUNNING，TV webhook 下單 | **實盤** TMF，權益 ~1.16M（07/02 補錢後） |
-| Gap Burst (trading-tmf-gap) | RUNNING，07/02 剛部署 | 模擬（paper trade） |
+| Gap Burst (trading-tmf-gap) | RUNNING，07/03 首日驗證成功(試撮/ref_close/門檻判斷皆正常，兩場皆SKIP未觸發)，07/04 依 overnight research 更新 1500 TP 為動態 + 修正試撮 fallback | 模擬（paper trade），尚無實際成交筆數 |
 | NQ 策略 (trading-tmf-nq) | **已退役** | — |
 | balance_log.csv | ✅ 07/02 修復（06/23~07/01 斷檔：app.py 重寫時誤刪 snapshot thread，已補回） | — |
 
-近期待辦：Gap 策略首次觸發驗證（見 GAP_STRATEGY.md §6）、V38 漏單 root cause（webhook_raw.csv 累積中）、V38 Status.Failed=可委託金額不足（user 已補錢）。
+近期待辦：Gap 策略等第一個真正觸發日（驗證 fill/TP/停損/cap 鏈路，見 GAP_STRATEGY.md §6）、V38 漏單 root cause（webhook_raw.csv 累積中）、V38 Status.Failed=可委託金額不足（user 已補錢）。
+
+**07/04 overnight research 結論摘要**（user 睡覺期間跑的，細節見 GAP_STRATEGY.md §3.1）：
+1. 重大限制：Shioaji 歷史 tick API 不保留開盤前試撮資料，**無法**回測試撮讀值準確度，只能持續累積 live `gap_calibration.csv`
+2. 門檻 0.5%(0845)/0.3%(1500) 經 walk-forward(H1 01-03月 / H2 04-07月) 驗證仍是最穩健的選擇，維持不動
+3. 動態 TP：0845 測了正向、反向都輸固定 TP80（因為大 gap 日的 MFE 沒有比較大，甚至略小）→ 維持固定；**1500 有效**（gap 越大 follow-through 越大是穩定的正相關），改用 `clip(0.4×gap_pts,100,300)`，H2 樣本外 EV 從 +239 提升到 +299 → **已部署**
+4. 動態停損（兩場都測）全部更差，worst case 從 -356/-856 惡化到 -1200~-1550 → 不採用
+5. 邏輯修正：試撮讀值若最後一筆(:50)剛好缺值，改 fallback 用最近一筆有值的快照，避免無謂 SKIP
 
 ---
 
