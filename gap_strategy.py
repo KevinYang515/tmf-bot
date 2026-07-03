@@ -72,6 +72,7 @@ SESSIONS = {
         "tp_dynamic":   None,
         "stop":         30,
         "cap_seconds":  300,
+        "direction_filter": None,     # 多空都做：0845 的多空差距小(EV 236 vs 377, n=13/6)不足以下重手
     },
     "1500": {
         "prep_time":    "14:57",
@@ -86,6 +87,10 @@ SESSIONS = {
         "tp_dynamic":   {"alpha": 0.4, "lo": 100, "hi": 300},
         "stop":         80,           # 停損維持固定：動態停損掃描(D3)全部更差 worst 大幅惡化
         "cap_seconds":  180,
+        # 2026-07-04 發現：跳空向上(做多) n=13 EV -95 (H1 -66/H2 -114，兩段皆負)；
+        # 跳空向下(做空) n=11 EV +725 (H1 +497/H2 +1124，兩段皆強正)。用現行動態TP基準重新驗證過，
+        # 不是舊固定TP100的偽訊號。方向不對稱夠大 -> 只做空，做多方向直接跳過不下單。
+        "direction_filter": -1,
     },
 }
 
@@ -486,8 +491,17 @@ def handle_session(session_key):
             logger.info(f"[{session_key}] gap = {gap_pct:+.3f}%  門檻 {cfg['threshold']}% → "
                         f"{'多' if direction == 1 else '空' if direction == -1 else 'SKIP'}")
 
+        # 方向過濾（例如 1500 只做空：跳空向上做多 EV 為負，見 SESSIONS 註解）
+        # 仍保留原始 direction 供 calibration CSV 記錄，只有下單用的 direction 被過濾
+        dfilter = cfg.get("direction_filter")
+        trade_direction = direction
+        if direction != 0 and dfilter is not None and direction != dfilter:
+            logger.info(f"[{session_key}] 方向濾網：只做 {'多' if dfilter==1 else '空'}，"
+                        f"本次是{'多' if direction==1 else '空'} → 不下單（僅記錄校準資料）")
+            trade_direction = 0
+
         entry_trade = None
-        if direction != 0:
+        if trade_direction != 0:
             line_notify(f"{session_key} 觸發 gap={gap_pct:+.3f}% "
                         f"{'多' if direction == 1 else '空'} (試撮 {trial:.0f} vs 收 {ref_close:.0f})")
             entry_trade = place_moo_entry(contract, direction, POSITION_QTY)
@@ -513,10 +527,10 @@ def handle_session(session_key):
             "actual_open": actual_open,
             "gap_at_decide_pct": round(gap_pct, 4) if gap_pct is not None else None,
             "gap_actual_pct": round(gap_actual, 4) if gap_actual is not None else None,
-            "triggered": int(direction != 0), "direction": direction,
+            "triggered": int(trade_direction != 0), "direction": direction,
         })
 
-        if direction == 0 or entry_trade is None:
+        if entry_trade is None:
             return
 
         # 5. 取 fill 價
