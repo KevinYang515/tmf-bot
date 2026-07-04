@@ -16,7 +16,7 @@
 | NQ 策略 (trading-tmf-nq) | **已退役** | — |
 | balance_log.csv | ✅ 07/02 修復（06/23~07/01 斷檔：app.py 重寫時誤刪 snapshot thread，已補回） | — |
 
-近期待辦：Gap 策略等第一個真正觸發日（驗證 fill/TP/停損/cap 鏈路，見 GAP_STRATEGY.md §6）、V38 漏單 root cause（webhook_raw.csv 累積中）、V38 Status.Failed=可委託金額不足（user 已補錢）。
+近期待辦：Gap 策略等第一個真正觸發日（驗證 fill/TP/停損/cap 鏈路，見 GAP_STRATEGY.md §6）、**秒級出場變體評估中**（GAP_STRATEGY.md §3.4：從真實交易者成交明細逆向出的「3秒全出+停損50」，回測 EV +264 vs 現行 +172 且 H1/H2 都穩，等首批真實成交驗證滑價假設後決定是否切換）、V38 漏單 root cause（webhook_raw.csv 累積中）、V38 Status.Failed=可委託金額不足（user 已補錢）。
 
 **07/04 overnight research 結論摘要**（user 睡覺期間跑的兩輪，細節見 GAP_STRATEGY.md §3.1/§3.2）：
 1. 重大限制：Shioaji 歷史 tick API 不保留開盤前試撮資料，**無法**回測試撮讀值準確度，只能持續累積 live `gap_calibration.csv`
