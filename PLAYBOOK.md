@@ -1,6 +1,6 @@
 # TMF 自動交易系統 Playbook
 
-> 最後更新：2026-07-04（Gap Burst overnight research pass：門檻/動態TP walk-forward 驗證 + 邏輯修正）
+> 最後更新：2026-07-04（Gap Burst：門檻/動態TP walk-forward 驗證、1500只做空、修復週一ref_close與週末誤觸發兩個bug）
 > 適用：新 session 快速 onboarding、策略回顧、系統維護
 >
 > **相關文件**：
@@ -12,7 +12,7 @@
 | 系統 | 狀態 | 錢 |
 |---|---|---|
 | V38 (trading-app, app.py) | RUNNING，TV webhook 下單 | **實盤** TMF，權益 ~1.16M（07/02 補錢後） |
-| Gap Burst (trading-tmf-gap) | RUNNING，07/03 首日驗證成功(試撮/ref_close/門檻判斷皆正常，兩場皆SKIP未觸發)，07/04 依 overnight research 更新 1500 TP 為動態 + 修正試撮 fallback | 模擬（paper trade），尚無實際成交筆數 |
+| Gap Burst (trading-tmf-gap) | RUNNING，07/03 首日驗證成功(試撮/ref_close/門檻判斷皆正常，兩場皆SKIP未觸發)，07/04 兩輪 overnight research：1500改動態TP+只做空，0845維持不變，並修復週一ref_close/週末誤觸發兩個bug | 模擬（paper trade），尚無實際成交筆數 |
 | NQ 策略 (trading-tmf-nq) | **已退役** | — |
 | balance_log.csv | ✅ 07/02 修復（06/23~07/01 斷檔：app.py 重寫時誤刪 snapshot thread，已補回） | — |
 

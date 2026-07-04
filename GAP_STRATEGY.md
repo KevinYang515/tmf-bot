@@ -228,10 +228,12 @@ n=6 樣本很薄，這個「週一應該排除」的判斷信心不如 1500 多�
 
 ### 復現方式（新增）
 ```
-D:\stock\tmf-bot\backtest\probe_monday_kbars.py       驗證週一05:00 bar被標在週六
 D:\stock\tmf-bot\backtest\backfill_monday_ref.py      回填26個缺失日的正確gap_night_pct(需VM Shioaji)
 D:\stock\tmf-bot\backtest\fetch_monday_ticks.py       抓6個新發現週一的tick資料
 D:\stock\tmf-bot\backtest\gap_monday_backtest.py      6個週一回測 + 併入原19天重新驗證
+（驗證週一05:00 bar被標在週六的探測腳本是一次性診斷，用完就刪了；
+ 重驗證邏輯：對任一contract呼叫 api.kbars(contract, start=跨週末日期, end=同一週末日期)，
+ 看05:00 bar落在哪一天即可重現）
 ```
 
 ## 4. 為什麼散戶做得起（vs HFT）
