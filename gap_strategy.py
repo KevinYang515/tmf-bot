@@ -141,7 +141,7 @@ def save_state(s):
 
 state = load_state()
 
-CALIB_HEADERS = ["date", "session", "ref_close",
+CALIB_HEADERS = ["date", "session", "ref_close", "ref_stale_days",
                  "trial_1", "trial_2", "trial_3", "trial_4",
                  "actual_open", "gap_at_decide_pct", "gap_actual_pct",
                  "triggered", "direction"]
@@ -183,21 +183,32 @@ def get_tmf_contract():
 
 
 def fetch_ref_close(contract, hm):
-    """今日 kbars 指定 (hour, minute) bar 的 close — 夜盤收 05:00 / 日盤收 13:45"""
-    today = now_tp().strftime("%Y-%m-%d")
+    """指定 (hour, minute) bar 的 close — 夜盤收 05:00 / 日盤收 13:45
+    週一（或連假後第一個交易日）查『今天』kbars 會抓不到：週五夜盤 15:00->05:00
+    橫跨到隔天，05:00 那根 bar 實際上是標在『週六』的日期，不是週一。改查過去
+    4 天的窗口，取範圍內最後一根符合 (hour,minute) 的 bar，不管它被標在哪一天。
+    回傳 (close, bar_date_str)，呼叫端可用 bar_date 判斷這根參考價隔了幾天
+    （2026-07-04 發現：週一撈到的其實是週六的 bar，隔了 2 天，這種『跨週末』的
+    gap 本質上更接近舊聞而非意外，回測顯示這樣算出來的 gap 用現行 TP/停損反而
+    是負 EV，見 GAP_STRATEGY.md §3.3）。
+    """
+    today_dt = now_tp()
+    today = today_dt.strftime("%Y-%m-%d")
+    start = (today_dt - pd.Timedelta(days=4)).strftime("%Y-%m-%d")
     try:
-        kb = api.kbars(contract, start=today, end=today)
+        kb = api.kbars(contract, start=start, end=today)
         df = pd.DataFrame({**kb})
         if df.empty:
-            return None
+            return None, None
         df["ts"] = pd.to_datetime(df["ts"])
         m = df[(df["ts"].dt.hour == hm[0]) & (df["ts"].dt.minute == hm[1])]
         if m.empty:
-            return None
-        return float(m.iloc[-1]["Close"])
+            return None, None
+        bar_ts = m.iloc[-1]["ts"]
+        return float(m.iloc[-1]["Close"]), bar_ts.strftime("%Y-%m-%d")
     except Exception as e:
         logger.error(f"[RefClose] {e}")
-        return None
+        return None, None
 
 
 # ==========================================
@@ -452,11 +463,20 @@ def handle_session(session_key):
     contract = get_tmf_contract()
 
     # 1. 參考收盤價
-    ref_close = fetch_ref_close(contract, cfg["ref_bar_hm"])
+    ref_close, ref_bar_date = fetch_ref_close(contract, cfg["ref_bar_hm"])
     if ref_close is None:
         logger.warning(f"[{session_key}] 參考收盤價取不到 → SKIP (假日/資料缺)")
         return
-    logger.info(f"[{session_key}] ref_close ({cfg['ref_bar_hm'][0]:02d}:{cfg['ref_bar_hm'][1]:02d}) = {ref_close:.0f}")
+    logger.info(f"[{session_key}] ref_close ({cfg['ref_bar_hm'][0]:02d}:{cfg['ref_bar_hm'][1]:02d}) = {ref_close:.0f}"
+                f"  (bar日期={ref_bar_date})")
+
+    # 參考價隔了 2 天以上 = 跨週末/連假（週一常見：週五夜盤 05:00 收盤其實標在週六）。
+    # 這種 gap 本質上更接近『舊聞』而非『意外』，回測顯示用現行 TP/停損反而是負 EV
+    # （n=6, EV -173, 5/6 觸停損；見 GAP_STRATEGY.md §3.3）。仍記錄校準資料，只是不下單。
+    ref_stale_days = (pd.Timestamp(today_str) - pd.Timestamp(ref_bar_date)).days
+    is_stale_ref = ref_stale_days >= 2
+    if is_stale_ref:
+        logger.info(f"[{session_key}] 參考價隔了 {ref_stale_days} 天（跨週末/連假）→ 本場只記錄校準資料，不下單")
 
     # 2. 訂閱 tick, 收集試撮快照
     subscribe_ticks(contract)
@@ -500,6 +520,11 @@ def handle_session(session_key):
                         f"本次是{'多' if direction==1 else '空'} → 不下單（僅記錄校準資料）")
             trade_direction = 0
 
+        # 參考價過舊（跨週末/連假）→ 不下單，只記錄校準資料
+        if direction != 0 and is_stale_ref:
+            logger.info(f"[{session_key}] 參考價過舊 → 不下單（僅記錄校準資料）")
+            trade_direction = 0
+
         entry_trade = None
         if trade_direction != 0:
             line_notify(f"{session_key} 觸發 gap={gap_pct:+.3f}% "
@@ -522,6 +547,7 @@ def handle_session(session_key):
         # 校準記錄
         append_csv(CALIB_CSV, CALIB_HEADERS, {
             "date": today_str, "session": session_key, "ref_close": ref_close,
+            "ref_stale_days": ref_stale_days,
             "trial_1": trials[0], "trial_2": trials[1],
             "trial_3": trials[2], "trial_4": trials[3],
             "actual_open": actual_open,
@@ -627,6 +653,12 @@ def main():
             last_minute = now_hm
 
             reset_daily_state_if_new_day()
+
+            # 週末不交易（TAIFEX 週六日不開盤）。之前沒檢查過，07/04(六) 0845 曾誤觸發
+            # 跑出 ref_close==trial 全部同值、actual_open 抓不到的異常資料列。
+            if now_tp().weekday() >= 5:
+                time.sleep(5)
+                continue
 
             for session_key, cfg in SESSIONS.items():
                 if now_hm == cfg["prep_time"]:
