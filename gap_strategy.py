@@ -60,6 +60,15 @@ POSITION_QTY   = 1
 POINT_VALUE    = 10      # TMF NT$10/pt
 
 # session 參數（tick 級回測定版 2026-07-04，overnight research 更新見 GAP_STRATEGY.md）
+#
+# exit_mode 說明（新增於 2026-07-07，見 GAP_STRATEGY.md §3.4）：
+#   "tp_cap"（預設，1500 目前使用）：躺簿 TP + tick 停損監控 + 分鐘級時間上限
+#   "seconds"（尚未在任何 session 啟用，備妥待部署）：不掛 TP，開盤 tick 價當
+#       進場基準（跳過券商成交確認的 2~12 秒輪詢），停損 + 固定秒數時間上限，
+#       兩者先到者送 MKP 全平。回測 EV +264（3秒/停損50） vs tp_cap 現行 +172，
+#       且無論 TP 掛多寬都是「不掛TP直接秒數到全出」比較好（混合方案全部更差，
+#       見 GAP_STRATEGY.md §3.4）。要啟用只需把某 session 的 exit_mode 改成
+#       "seconds" 並設定 hold_seconds/stop，不需要動這裡以外的程式碼。
 SESSIONS = {
     "0845": {
         "prep_time":    "08:42",      # 主迴圈觸發（分鐘級）
@@ -68,10 +77,12 @@ SESSIONS = {
         "open_time":    "08:45:00",
         "ref_bar_hm":   (5, 0),       # 夜盤收 = 今日 05:00 bar close
         "threshold":    0.5,          # |gap %|
+        "exit_mode":    "tp_cap",     # 尚未切換為"seconds"：待首批真實成交驗證滑價假設後再決定
         "tp":           80,           # 固定 TP：動態 TP 掃描過(D1~D5)全部更差，gap 越大 MFE 反而略降
         "tp_dynamic":   None,
         "stop":         30,
         "cap_seconds":  300,
+        "hold_seconds": 3.0,          # 只有 exit_mode="seconds" 時使用
         "direction_filter": None,     # 多空都做：0845 的多空差距小(EV 236 vs 377, n=13/6)不足以下重手
     },
     "1500": {
@@ -81,6 +92,7 @@ SESSIONS = {
         "open_time":    "15:00:00",
         "ref_bar_hm":   (13, 45),     # 日盤收 = 今日 13:45 bar close
         "threshold":    0.3,
+        "exit_mode":    "tp_cap",     # 1500 follow-through是分鐘級，秒級出場測試中EV較差，維持tp_cap
         "tp":           100,          # tp_dynamic 有值時當地板(lo)
         # 動態 TP = clip(alpha * |gap_pts|, lo, hi)；gap_pts 用 |fill_price - ref_close|
         # H1/H2 walk-forward 驗證: 固定TP100 H2 EV+239 -> 動態 H2 EV+299 (n=12 each)，全樣本+251->+281
@@ -440,6 +452,53 @@ def monitor_position(contract, direction, stop_price, cap_seconds, open_dt):
     return reason, exit_px
 
 
+def monitor_position_seconds(contract, direction, stop_price, hold_seconds, open_dt):
+    """
+    秒級出場（exit_mode="seconds"）：不掛 TP，時間到(hold_seconds)或停損觸及，
+    兩者先發生者送 MKP 全平。
+
+    跟 monitor_position() 的關鍵差異：
+    - 不 poll 券商成交狀態判斷「TP 是否已成」（沒有TP單），省掉 REST round-trip
+    - 輪詢間隔用 min(remaining, 0.05)秒，不是固定3秒——3秒的總持倉時間裡，
+      用3秒的輪詢間隔去檢查時間上限會嚴重失準，必須用更細的間隔
+    - 回測結論（GAP_STRATEGY.md §3.4）：躺簿TP+此時間上限的混合方案，
+      不論TP設多寬都輸給「不掛TP、單純時間到全出」，所以這裡沒有TP分支
+    """
+    logger.info(f"[Monitor-Sec] stop={stop_price:.0f}  hold={hold_seconds}s")
+    _tick_state.update({
+        "mon_active": True,
+        "mon_direction": direction,
+        "mon_stop_price": stop_price,
+        "mon_exit_reason": None,
+    })
+    _tick_state["mon_event"].clear()
+
+    deadline = open_dt.timestamp() + hold_seconds
+    reason, exit_px = None, None
+    try:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                with _tick_lock:
+                    _tick_state["mon_active"] = False
+                reason = "time_cap_sec"
+                logger.info(f"[Monitor-Sec] {hold_seconds}s 時間到 → 強制平倉")
+                market_close(contract, direction, "SecExit-MKP")
+                exit_px = _tick_state["last_real_price"]
+                break
+
+            if _tick_state["mon_event"].wait(timeout=min(remaining, 0.05)):
+                reason = _tick_state["mon_exit_reason"]
+                market_close(contract, direction, "Stop-MKP")
+                exit_px = _tick_state["last_real_price"] or stop_price
+                line_notify(f"秒級停損出場 {reason}")
+                break
+    finally:
+        with _tick_lock:
+            _tick_state["mon_active"] = False
+    return reason, exit_px
+
+
 # ==========================================
 # 7. 主邏輯 — 一個 session 的完整流程
 # ==========================================
@@ -559,51 +618,71 @@ def handle_session(session_key):
         if entry_trade is None:
             return
 
-        # 5. 取 fill 價
-        time.sleep(2)
-        fill_price = None
-        for attempt in range(10):
-            try:
-                api.update_status(api.futopt_account)
-                for t in api.list_trades():
-                    if t.status.id == entry_trade.status.id and t.status.deals:
-                        qty_w = sum(d.quantity * d.price for d in t.status.deals)
-                        qty_s = sum(d.quantity for d in t.status.deals)
-                        if qty_s > 0:
-                            fill_price = qty_w / qty_s
-                            break
-            except Exception as e:
-                logger.warning(f"[Fill attempt {attempt+1}] {e}")
-            if fill_price is not None:
-                break
-            time.sleep(1)
+        exit_mode = cfg.get("exit_mode", "tp_cap")
 
-        if fill_price is None:
+        if exit_mode == "seconds":
+            # 秒級出場：進場基準直接用已捕捉到的 tick 開盤價（集合競價滑價趨近0，
+            # 已於07/03驗證），不等券商成交確認的2~12秒輪詢——那個輪詢在3秒持倉
+            # 的時間尺度下會直接吃掉整個交易窗口。見 GAP_STRATEGY.md §3.4。
             fill_price = actual_open or _tick_state["last_real_price"]
             if fill_price is None:
-                logger.error(f"[{session_key}] 取不到 fill/開盤價 → 強制平倉退出")
+                logger.error(f"[{session_key}] 取不到開盤價 → 強制平倉退出")
                 cancel_pending_orders()
                 market_close(contract, direction, "NoFill-Abort")
                 return
-            logger.warning(f"[{session_key}] 用開盤價估 fill = {fill_price:.0f}")
+            logger.info(f"[{session_key}] Entry Fill(秒級,tick開盤價) = {fill_price:.0f}")
 
-        logger.info(f"[{session_key}] Entry Fill = {fill_price:.0f}")
+            tp_pts = None  # 秒級模式不設TP：混合方案(躺簿TP+秒數上限)全部輸純秒數出場，見§3.4
+            stop_p = fill_price - direction * cfg["stop"]
+            reason, exit_px = monitor_position_seconds(contract, direction, stop_p,
+                                                       cfg["hold_seconds"], open_dt)
+        else:
+            # 6. TP + 停損監控 + 時間上限（原有邏輯，1500 沿用）
+            # 取 fill 價
+            time.sleep(2)
+            fill_price = None
+            for attempt in range(10):
+                try:
+                    api.update_status(api.futopt_account)
+                    for t in api.list_trades():
+                        if t.status.id == entry_trade.status.id and t.status.deals:
+                            qty_w = sum(d.quantity * d.price for d in t.status.deals)
+                            qty_s = sum(d.quantity for d in t.status.deals)
+                            if qty_s > 0:
+                                fill_price = qty_w / qty_s
+                                break
+                except Exception as e:
+                    logger.warning(f"[Fill attempt {attempt+1}] {e}")
+                if fill_price is not None:
+                    break
+                time.sleep(1)
 
-        # 6. TP + 停損監控 + 時間上限
-        tp_pts = cfg["tp"]
-        dyn = cfg.get("tp_dynamic")
-        if dyn:
-            gap_pts_now = abs(fill_price - ref_close)
-            tp_pts = min(max(dyn["alpha"] * gap_pts_now, dyn["lo"]), dyn["hi"])
-            logger.info(f"[{session_key}] 動態 TP: gap_pts={gap_pts_now:.0f} -> TP={tp_pts:.0f}")
-        tp_p = fill_price + direction * tp_pts
-        stop_p = fill_price - direction * cfg["stop"]
-        place_tp_limit(contract, direction, POSITION_QTY, tp_p)
+            if fill_price is None:
+                fill_price = actual_open or _tick_state["last_real_price"]
+                if fill_price is None:
+                    logger.error(f"[{session_key}] 取不到 fill/開盤價 → 強制平倉退出")
+                    cancel_pending_orders()
+                    market_close(contract, direction, "NoFill-Abort")
+                    return
+                logger.warning(f"[{session_key}] 用開盤價估 fill = {fill_price:.0f}")
 
-        reason, exit_px = monitor_position(contract, direction, stop_p,
-                                           cfg["cap_seconds"], open_dt)
-        if reason and reason.startswith("tp_filled") and exit_px is None:
-            exit_px = tp_p
+            logger.info(f"[{session_key}] Entry Fill = {fill_price:.0f}")
+
+            tp_pts = cfg["tp"]
+            dyn = cfg.get("tp_dynamic")
+            if dyn:
+                gap_pts_now = abs(fill_price - ref_close)
+                tp_pts = min(max(dyn["alpha"] * gap_pts_now, dyn["lo"]), dyn["hi"])
+                logger.info(f"[{session_key}] 動態 TP: gap_pts={gap_pts_now:.0f} -> TP={tp_pts:.0f}")
+            tp_p = fill_price + direction * tp_pts
+            stop_p = fill_price - direction * cfg["stop"]
+            place_tp_limit(contract, direction, POSITION_QTY, tp_p)
+
+            reason, exit_px = monitor_position(contract, direction, stop_p,
+                                               cfg["cap_seconds"], open_dt)
+            if reason and reason.startswith("tp_filled") and exit_px is None:
+                exit_px = tp_p
+
         logger.info(f"[{session_key}] 出場: {reason} @ {exit_px if exit_px else 'N/A'}")
 
         pnl_pt = None
@@ -613,7 +692,9 @@ def handle_session(session_key):
             "date": today_str, "session": session_key, "direction": direction,
             "ref_close": ref_close, "trial_price": trial,
             "gap_pct": round(gap_pct, 4),
-            "fill_price": fill_price, "tp_used": round(tp_pts, 1), "exit_reason": reason,
+            "fill_price": fill_price,
+            "tp_used": round(tp_pts, 1) if tp_pts is not None else None,
+            "exit_reason": reason,
             "exit_price_est": exit_px,
             "pnl_pt_est": round(pnl_pt, 1) if pnl_pt is not None else None,
             "pnl_twd_est": round(pnl_pt * POINT_VALUE * POSITION_QTY, 0) if pnl_pt is not None else None,
@@ -634,12 +715,16 @@ def reset_daily_state_if_new_day():
     save_state(state)
 
 
+def _cfg_summary(cfg):
+    if cfg.get("exit_mode") == "seconds":
+        return f"秒級出場 stop-{cfg['stop']} hold {cfg['hold_seconds']}s (無TP)"
+    return f"TP+{cfg['tp']} stop-{cfg['stop']} cap {cfg['cap_seconds']}s"
+
+
 def main():
     logger.info("=== Gap Burst Strategy 啟動 ===")
-    logger.info(f"0845: 試撮 vs 夜盤收 |gap|>={SESSIONS['0845']['threshold']}% "
-                f"TP+{SESSIONS['0845']['tp']} stop-{SESSIONS['0845']['stop']} cap {SESSIONS['0845']['cap_seconds']}s")
-    logger.info(f"1500: 試撮 vs 日盤收 |gap|>={SESSIONS['1500']['threshold']}% "
-                f"TP+{SESSIONS['1500']['tp']} stop-{SESSIONS['1500']['stop']} cap {SESSIONS['1500']['cap_seconds']}s")
+    logger.info(f"0845: 試撮 vs 夜盤收 |gap|>={SESSIONS['0845']['threshold']}% {_cfg_summary(SESSIONS['0845'])}")
+    logger.info(f"1500: 試撮 vs 日盤收 |gap|>={SESSIONS['1500']['threshold']}% {_cfg_summary(SESSIONS['1500'])}")
 
     login_shioaji()
 
