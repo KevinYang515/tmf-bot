@@ -10,15 +10,15 @@ from engine_v26 import load_1min, run, POINT_VALUE
 OUT = r"D:\stock\tmf-bot\backtest\strategy_v26\opt_results.csv"
 
 VARIANTS = {
-    "baseline":        {},
-    "stale7":          {"opt_stale_hr": 7},
-    "stale9":          {"opt_stale_hr": 9},
-    "stale10":         {"opt_stale_hr": 10},
-    "cd30+stale7":     {"opt_cooldown_min": 30, "opt_stale_hr": 7},
-    "cd30+stale8":     {"opt_cooldown_min": 30, "opt_stale_hr": 8},
-    "cd30+stale9":     {"opt_cooldown_min": 30, "opt_stale_hr": 9},
-    "cd30+stale10":    {"opt_cooldown_min": 30, "opt_stale_hr": 10},
-    "cd30+stale10+o8": {"opt_cooldown_min": 30, "opt_stale_hr": 10, "opt_block_open": True},
+    "baseline":          {},
+    "cd30+stale10close": {"opt_cooldown_min": 30, "opt_stale_hr": 10},
+    "trail10_k0.5":      {"opt_stale_hr": 10, "opt_stale_mode": "trail", "opt_stale_trail_atr": 0.5},
+    "trail10_k1.0":      {"opt_stale_hr": 10, "opt_stale_mode": "trail", "opt_stale_trail_atr": 1.0},
+    "trail10_k1.5":      {"opt_stale_hr": 10, "opt_stale_mode": "trail", "opt_stale_trail_atr": 1.5},
+    "trail10_k2.0":      {"opt_stale_hr": 10, "opt_stale_mode": "trail", "opt_stale_trail_atr": 2.0},
+    "cd30+trail10_k1.0": {"opt_cooldown_min": 30, "opt_stale_hr": 10, "opt_stale_mode": "trail", "opt_stale_trail_atr": 1.0},
+    "cd30+trail10_k1.5": {"opt_cooldown_min": 30, "opt_stale_hr": 10, "opt_stale_mode": "trail", "opt_stale_trail_atr": 1.5},
+    "cd30+trail8_k1.0":  {"opt_cooldown_min": 30, "opt_stale_hr": 8, "opt_stale_mode": "trail", "opt_stale_trail_atr": 1.0},
 }
 
 

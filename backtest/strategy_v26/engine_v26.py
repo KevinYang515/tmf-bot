@@ -30,7 +30,9 @@ P = dict(  # v26 預設參數
     opt_cooldown_min=0,        # Trend Rev / Cmd_Fast 出場後 N 分鐘禁首倉
     opt_cooldown_scope="both", # "both" | "trev" (只在 Trend Rev 後冷卻)
     opt_adx_short=False,       # S_Cmd 也套 ADX 濾網
-    opt_stale_hr=0,            # 持倉超過 N 小時且未獲利 → 下一開盤平該口 (0=off)
+    opt_stale_hr=0,            # 持倉超過 N 小時且未獲利 → 觸發滯留處理 (0=off)
+    opt_stale_mode="close",    # "close"=下一開盤平倉 | "trail"=改掛追蹤停損
+    opt_stale_trail_atr=1.0,   # trail 模式: stop = close ∓ k*ATR, 逐 bar 棘輪收緊
 )
 
 
@@ -129,7 +131,7 @@ def _segments(o, h, l, c):
 
 class Lot:
     __slots__ = ("kind", "entry_px", "entry_ts", "trail_act", "trail_on",
-                 "peak", "loss_stop", "be_stop", "bracket_live", "tv_id")
+                 "peak", "loss_stop", "be_stop", "bracket_live", "stale_stop", "tv_id")
 
     def __init__(self, kind, entry_px, entry_ts, bracket_live):
         self.kind = kind          # 'Cmd' / 'Add' / 'G'
@@ -140,6 +142,7 @@ class Lot:
         self.peak = None
         self.loss_stop = None
         self.be_stop = None
+        self.stale_stop = None    # 滯留追蹤停損 (opt_stale_mode="trail")
         self.bracket_live = bracket_live  # 是否已有有效出場單 (前一收盤發出)
 
 
@@ -372,12 +375,22 @@ def run(df1m, p=None, intrabar_mode="ohlc", start=None, end=None):
                     if cd_trev:
                         cooldown_until = t_close + np.timedelta64(p["opt_cooldown_min"], "m")
 
-            # 滯留單時間停損: 持倉 N 小時仍未獲利 → 下一開盤平倉
+            # 滯留單處理: 持倉 N 小時仍未獲利 → 平倉或改掛追蹤停損
             if p["opt_stale_hr"]:
                 for lot in lots:
                     held_hr = (t_close - lot.entry_ts) / np.timedelta64(1, "h")
-                    if held_hr >= p["opt_stale_hr"] and (c - lot.entry_px) * direction < 0:
-                        pending.append(("close_lot_ts", (lot.entry_ts, "TimeStop")))
+                    is_stale = held_hr >= p["opt_stale_hr"] and (c - lot.entry_px) * direction < 0
+                    if p["opt_stale_mode"] == "close":
+                        if is_stale:
+                            pending.append(("close_lot_ts", (lot.entry_ts, "TimeStop")))
+                    else:  # trail: 一旦觸發即持續棘輪收緊, 直到出場
+                        if is_stale or lot.stale_stop is not None:
+                            new_stop = round(c - direction * p["opt_stale_trail_atr"] * atr_i)
+                            if lot.stale_stop is None:
+                                lot.stale_stop = new_stop
+                            else:
+                                lot.stale_stop = max(lot.stale_stop, new_stop) if direction > 0 \
+                                    else min(lot.stale_stop, new_stop)
 
     # 期末強制平倉
     for lot in lots[:]:
@@ -390,7 +403,7 @@ def run(df1m, p=None, intrabar_mode="ohlc", start=None, end=None):
 
 
 def _eff_stop(lot, direction):
-    stops = [s for s in (lot.loss_stop, lot.be_stop,
+    stops = [s for s in (lot.loss_stop, lot.be_stop, lot.stale_stop,
                          (lot.peak - 1 if direction > 0 else lot.peak + 1) if lot.trail_on else None)
              if s is not None]
     if not stops:
@@ -403,6 +416,8 @@ def _stop_name(lot, eff, direction):
     side = "L" if direction > 0 else "S"
     if trail_stop is not None and eff == trail_stop:
         return f"{side}_Exit" + ("_Add" if lot.kind == "Add" else "_G" if lot.kind == "G" else "")
+    if lot.stale_stop is not None and eff == lot.stale_stop:
+        return "TimeTrail"
     if lot.be_stop is not None and eff == lot.be_stop:
         return f"{side}_BE"
     return f"{side}_Exit" + ("_Add" if lot.kind == "Add" else "_G" if lot.kind == "G" else "") + "_SL"
