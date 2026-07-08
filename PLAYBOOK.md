@@ -1,6 +1,6 @@
 # TMF 自動交易系統 Playbook
 
-> 最後更新：2026-07-04（Gap Burst：門檻/動態TP walk-forward 驗證、1500只做空、修復週一ref_close與週末誤觸發兩個bug）
+> 最後更新：2026-07-09（Gap Burst：門檻放寬測試否決、試撮外插修正已部署，見 GAP_STRATEGY.md §3.5）／2026-07-04（門檻/動態TP walk-forward 驗證、1500只做空、修復週一ref_close與週末誤觸發兩個bug）
 > 適用：新 session 快速 onboarding、策略回顧、系統維護
 >
 > **相關文件**：
@@ -12,11 +12,11 @@
 | 系統 | 狀態 | 錢 |
 |---|---|---|
 | V38 (trading-app, app.py) | RUNNING，TV webhook 下單 | **實盤** TMF，權益 ~1.16M（07/02 補錢後） |
-| Gap Burst (trading-tmf-gap) | RUNNING，07/03 首日驗證成功(試撮/ref_close/門檻判斷皆正常，兩場皆SKIP未觸發)，07/04 兩輪 overnight research：1500改動態TP+只做空，0845維持不變，並修復週一ref_close/週末誤觸發兩個bug | 模擬（paper trade），尚無實際成交筆數 |
+| Gap Burst (trading-tmf-gap) | RUNNING，07/03~07/08 六場皆 SKIP 未觸發，07/04 兩輪 overnight research 部署 1500動態TP+只做空+兩bug修復，**07/09 新增試撮外插修正**（門檻放寬 0.49%/0.48% 已細掃否決；改用最後兩筆試撮快照斜率外插到開盤時間點判斷觸發，n=2 驗證有效，門檻值/TP/停損不變，見 GAP_STRATEGY.md §3.5） | 模擬（paper trade），尚無實際成交筆數 |
 | NQ 策略 (trading-tmf-nq) | **已退役** | — |
 | balance_log.csv | ✅ 07/02 修復（06/23~07/01 斷檔：app.py 重寫時誤刪 snapshot thread，已補回） | — |
 
-近期待辦：Gap 策略等第一個真正觸發日（驗證 fill/TP/停損/cap 鏈路，見 GAP_STRATEGY.md §6）、**0845 秒級出場變體已定案為下一步（見下方摘要 9）**、V38 漏單 root cause（webhook_raw.csv 累積中）、V38 Status.Failed=可委託金額不足（user 已補錢）。
+近期待辦：Gap 策略等第一個真正觸發日（驗證 fill/TP/停損/cap 鏈路，見 GAP_STRATEGY.md §6）、**持續追蹤 07/09 新增的 `gap_projected_pct` vs `gap_actual_pct` 準度（n=2，優先監控項）**、0845 秒級出場變體待首批真實成交驗證後切換、V38 漏單 root cause（webhook_raw.csv 累積中）、V38 Status.Failed=可委託金額不足（user 已補錢）。
 
 **07/04 overnight research 結論摘要**（user 睡覺期間跑的兩輪，細節見 GAP_STRATEGY.md §3.1/§3.2）：
 1. 重大限制：Shioaji 歷史 tick API 不保留開盤前試撮資料，**無法**回測試撮讀值準確度，只能持續累積 live `gap_calibration.csv`

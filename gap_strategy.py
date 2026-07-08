@@ -155,7 +155,7 @@ state = load_state()
 
 CALIB_HEADERS = ["date", "session", "ref_close", "ref_stale_days",
                  "trial_1", "trial_2", "trial_3", "trial_4",
-                 "actual_open", "gap_at_decide_pct", "gap_actual_pct",
+                 "actual_open", "gap_at_decide_pct", "gap_projected_pct", "gap_actual_pct",
                  "triggered", "direction"]
 TRADE_HEADERS = ["date", "session", "direction", "ref_close", "trial_price",
                  "gap_pct", "fill_price", "tp_used", "exit_reason", "exit_price_est",
@@ -302,6 +302,34 @@ def get_trial_price(contract):
     except Exception as e:
         logger.error(f"[Snapshot] {e}")
     return None
+
+
+def _hms_to_sec(hms):
+    h, m, s = (int(x) for x in hms.split(":"))
+    return h * 3600 + m * 60 + s
+
+
+def project_trial(trials, snap_times, decide_time, open_time):
+    """用最後兩筆試撮快照的斜率外插到開盤時間點。
+
+    背景（2026-07-09，見 GAP_STRATEGY.md §3.5）：07-07、07-08 兩次 0845 決策當下
+    試撮讀值都還在門檻下方（0.458%、0.493%），但價格在最後兩筆快照間仍持續朝 gap
+    方向移動，10 秒後的實際開盤都已經過門檻（0.619%、0.595%）——決策用的是「凍結」
+    的最後一筆讀值，沒有把「當下還在走」這件事算進去。用 :45→:50 這 5 秒的斜率
+    外插到 :50→開盤的 10 秒，兩次都能正確判斷應該觸發，且對其餘 6 筆歷史校準樣本
+    （斜率為 0 或早已遠離門檻）不造成任何改變。只影響「要不要觸發」的判斷，
+    不影響下單方式(仍是MOO)/TP/停損——真正的滑價風險不變。
+    n=2（僅有的兩次真實誤判）：持續用 gap_calibration.csv 的 gap_projected_pct
+    欄位跟 gap_actual_pct 對照驗證，樣本太薄，是有物理機制支撐的假設，非數據硬凹。
+    """
+    if len(trials) < 2 or trials[-1] is None or trials[-2] is None:
+        return trials[-1] if trials else None
+    dt_last = _hms_to_sec(snap_times[-1]) - _hms_to_sec(snap_times[-2])
+    dt_to_open = _hms_to_sec(open_time) - _hms_to_sec(decide_time)
+    if dt_last <= 0:
+        return trials[-1]
+    slope = (trials[-1] - trials[-2]) / dt_last
+    return trials[-1] + slope * dt_to_open
 
 
 # ==========================================
@@ -557,17 +585,26 @@ def handle_session(session_key):
                     trial = p
                     logger.warning(f"[{session_key}] 最後一筆試撮缺值，改用較早的快照 {trial:.0f}")
                     break
+        # 試撮外插（2026-07-09，見 GAP_STRATEGY.md §3.5）：決策仍以外插值判斷是否
+        # 觸發，門檻值本身不變（backtest 證實真實 gap 若真的 <0.5%，交易品質確實差，
+        # 見 §3.5 細掃結果，不能靠降門檻解決）；gap_pct 保留原始試撮讀值供記錄比較。
+        projected_trial = project_trial(trials, cfg["snap_times"], cfg["decide_time"], cfg["open_time"])
+
         gap_pct = None
+        gap_projected_pct = None
         direction = 0
         if trial is not None and ref_close > 0:
             gap_pct = (trial - ref_close) / ref_close * 100
-            if abs(gap_pct) >= cfg["threshold"]:
-                direction = 1 if gap_pct > 0 else -1
+        if projected_trial is not None and ref_close > 0:
+            gap_projected_pct = (projected_trial - ref_close) / ref_close * 100
+            if abs(gap_projected_pct) >= cfg["threshold"]:
+                direction = 1 if gap_projected_pct > 0 else -1
 
         if gap_pct is None:
             logger.warning(f"[{session_key}] 試撮價取不到 → SKIP")
         else:
-            logger.info(f"[{session_key}] gap = {gap_pct:+.3f}%  門檻 {cfg['threshold']}% → "
+            logger.info(f"[{session_key}] gap(試撮)={gap_pct:+.3f}% gap(外插)={gap_projected_pct:+.3f}% "
+                        f" 門檻 {cfg['threshold']}% → "
                         f"{'多' if direction == 1 else '空' if direction == -1 else 'SKIP'}")
 
         # 方向過濾（例如 1500 只做空：跳空向上做多 EV 為負，見 SESSIONS 註解）
@@ -586,7 +623,7 @@ def handle_session(session_key):
 
         entry_trade = None
         if trade_direction != 0:
-            line_notify(f"{session_key} 觸發 gap={gap_pct:+.3f}% "
+            line_notify(f"{session_key} 觸發 gap(試撮)={gap_pct:+.3f}% gap(外插)={gap_projected_pct:+.3f}% "
                         f"{'多' if direction == 1 else '空'} (試撮 {trial:.0f} vs 收 {ref_close:.0f})")
             entry_trade = place_moo_entry(contract, direction, POSITION_QTY)
 
@@ -611,6 +648,7 @@ def handle_session(session_key):
             "trial_3": trials[2], "trial_4": trials[3],
             "actual_open": actual_open,
             "gap_at_decide_pct": round(gap_pct, 4) if gap_pct is not None else None,
+            "gap_projected_pct": round(gap_projected_pct, 4) if gap_projected_pct is not None else None,
             "gap_actual_pct": round(gap_actual, 4) if gap_actual is not None else None,
             "triggered": int(trade_direction != 0), "direction": direction,
         })
