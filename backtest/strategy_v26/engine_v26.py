@@ -33,6 +33,7 @@ P = dict(  # v26 預設參數
     opt_stale_hr=0,            # 持倉超過 N 小時且未獲利 → 觸發滯留處理 (0=off)
     opt_stale_mode="close",    # "close"=下一開盤平倉 | "trail"=改掛追蹤停損
     opt_stale_trail_atr=1.0,   # trail 模式: stop = close ∓ k*ATR, 逐 bar 棘輪收緊
+    opt_max_lots=4,            # 金字塔口數上限 (2=首倉+1加碼, 3=+2加碼, 4=完整含游擊)
 )
 
 
@@ -290,7 +291,9 @@ def run(df1m, p=None, intrabar_mode="ohlc", start=None, end=None):
 
         in_cooldown = cooldown_until is not None and t_close < cooldown_until
 
-        # 進場
+        # 進場 (opt_max_lots: 金字塔口數上限)
+        add_cap = min(3, p["opt_max_lots"])
+        allow_g = p["opt_max_lots"] >= 4
         if posSize == 0 and not isLongToxic and mtf_bull and c > B["ema_long"][i] and longTrigger and adx_ok and not in_cooldown:
             pending.append(("entry", ("Cmd", 1)))
             baseATR = atr_i
@@ -298,16 +301,16 @@ def run(df1m, p=None, intrabar_mode="ohlc", start=None, end=None):
                 and (adx_ok if p["opt_adx_short"] else True) and not in_cooldown:
             pending.append(("entry", ("Cmd", -1)))
             baseATR = atr_i
-        elif 0 < posSize < 3 and not isLongToxic and mtf_bull and c > avgPrice + baseATR * p["l_pyramid_dist"]:
+        elif 0 < posSize < add_cap and not isLongToxic and mtf_bull and c > avgPrice + baseATR * p["l_pyramid_dist"]:
             pending.append(("entry", ("Add", 1)))
             addATR = atr_i
-        elif posSize == 3 and not isLongToxic and c > avgPrice + baseATR * p["l_pyramid_dist"]:
+        elif posSize == 3 and allow_g and not isLongToxic and c > avgPrice + baseATR * p["l_pyramid_dist"]:
             pending.append(("entry", ("G", 1)))
             gATR = atr_i
-        elif -3 < posSize < 0 and not isShortToxic and mtf_bear and c < avgPrice - baseATR * p["s_pyramid_dist"]:
+        elif -add_cap < posSize < 0 and not isShortToxic and mtf_bear and c < avgPrice - baseATR * p["s_pyramid_dist"]:
             pending.append(("entry", ("Add", -1)))
             addATR = atr_i
-        elif posSize == -3 and not isShortToxic and c < avgPrice - baseATR * p["s_pyramid_dist"]:
+        elif posSize == -3 and allow_g and not isShortToxic and c < avgPrice - baseATR * p["s_pyramid_dist"]:
             pending.append(("entry", ("G", -1)))
             gATR = atr_i
 
