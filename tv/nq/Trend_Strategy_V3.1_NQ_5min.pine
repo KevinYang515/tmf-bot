@@ -1,0 +1,97 @@
+//@version=5
+strategy("Trend Strategy V3.1 [Production] - NQ 5m", overlay=true, initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1, currency=currency.USD)
+
+// ==========================================
+// 1. 聖杯參數設定 (Golden Parameters)
+// ==========================================
+// 經過 2016-2025 十年回測驗證，請勿隨意更動
+grp_core = "核心策略 (Core Strategy)"
+trendLen = input.int(80, title="趨勢濾網 (Trend EMA)", group=grp_core, tooltip="80 EMA 用於判定大趨勢方向")
+fastLen = input.int(9, title="進場快線 (Fast MA)", group=grp_core, tooltip="9 EMA 極速反應")
+slowLen = input.int(21, title="進場慢線 (Slow MA)", group=grp_core, tooltip="21 EMA 搭配快線形成黃金交叉/死亡交叉")
+
+grp_exit = "出場管理 (Exit Management)"
+atrLen = input.int(14, title="ATR 週期", group=grp_exit)
+longTrailMult = input.float(3.5, title="多單停利 (Long Trailing)", group=grp_exit, tooltip="3.5倍 ATR，讓利潤奔跑")
+shortTrailMult = input.float(1.8, title="空單停利 (Short Trailing)", group=grp_exit, tooltip="1.8倍 ATR，空頭閃電戰")
+
+// ==========================================
+// 2. 波動率濾網 (Volatility Filter)
+// ==========================================
+// 用於過濾 2017 年類型的死魚盤
+grp_vol = "風險控制 (Risk Management)"
+useVolFilter = input.bool(true, title="[開啟] ATR 波動濾網", group=grp_vol)
+atrThreshold = input.float(6.0, title="最小波動門檻 (ATR Threshold)", group=grp_vol, tooltip="當 5分K 波動小於 6 點時，禁止進場 (過濾盤整)")
+
+// ==========================================
+// 3. 回測時間範圍 (Backtest Period)
+// ==========================================
+grp_time = "回測時間 (Backtest Period)"
+useDateFilter = input.bool(true, title="啟用日期過濾", group=grp_time)
+startYear = input.int(2016, title="開始年份", group=grp_time)
+startMonth = input.int(1, title="開始月份", group=grp_time)
+endYear = input.int(2025, title="結束年份", group=grp_time)
+endMonth = input.int(12, title="結束月份", group=grp_time)
+
+// 時間判斷函數
+inDateRange = not useDateFilter or (time >= timestamp(syminfo.timezone, startYear, startMonth, 1, 0, 0) and time < timestamp(syminfo.timezone, endYear, endMonth, 30, 23, 59))
+
+// ==========================================
+// 4. 核心邏輯計算 (Calculations)
+// ==========================================
+// 計算均線
+fastMA = ta.ema(close, fastLen)
+slowMA = ta.ema(close, slowLen)
+trendMA = ta.ema(close, trendLen)
+atrValue = ta.atr(atrLen)
+
+// 市場體制判斷 (Market Regime)
+isBull = close > trendMA  // 價格在趨勢線之上 (只做多)
+isBear = close < trendMA  // 價格在趨勢線之下 (只做空)
+
+// 波動率判斷 (只在波動夠大時交易)
+isVolatile = not useVolFilter or (atrValue > atrThreshold)
+
+// 進場條件 (Entry Conditions)
+longCondition = ta.crossover(fastMA, slowMA) and isBull and inDateRange and isVolatile
+shortCondition = ta.crossunder(fastMA, slowMA) and isBear and inDateRange and isVolatile
+
+// ==========================================
+// 5. 交易執行 (Execution)
+// ==========================================
+if (longCondition)
+    strategy.entry("Long", strategy.long, comment="做多")
+
+if (shortCondition)
+    strategy.entry("Short", strategy.short, comment="做空")
+
+// ==========================================
+// 6. 出場邏輯 (Exits)
+// ==========================================
+// 計算動態停利點
+longDist = atrValue * longTrailMult
+shortDist = atrValue * shortTrailMult
+
+// 執行 ATR 移動停利
+if (strategy.position_size > 0)
+    strategy.exit("Exit Long", "Long", trail_points=longDist, trail_offset=5, comment_trailing="L_Trail")
+
+if (strategy.position_size < 0)
+    strategy.exit("Exit Short", "Short", trail_points=shortDist, trail_offset=5, comment_trailing="S_Trail")
+
+// 反向信號保底 (如果不幸沒觸發移動停利，交叉反轉時強制離場)
+if (ta.crossunder(fastMA, slowMA) and strategy.position_size > 0)
+    strategy.close("Long", comment="平多(反轉)")
+if (ta.crossover(fastMA, slowMA) and strategy.position_size < 0)
+    strategy.close("Short", comment="平空(反轉)")
+
+// ==========================================
+// 7. 圖表視覺化 (Visualization)
+// ==========================================
+// 繪製均線
+plot(fastMA, color=color.new(color.blue, 0), title="Fast MA (9)", linewidth=1)
+plot(slowMA, color=color.new(color.orange, 0), title="Slow MA (21)", linewidth=1)
+plot(trendMA, color=isBull ? color.green : color.red, linewidth=3, title="Trend Filter (80)")
+
+// 用灰色背景標記「低波動垃圾時間」(不交易區間)
+bgcolor(useVolFilter and atrValue <= atrThreshold ? color.new(color.gray, 90) : na, title="低波動過濾區")
