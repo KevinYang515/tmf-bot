@@ -1,0 +1,10 @@
+You are an independent reviewer. READ-ONLY: do not modify any file. Answer in Traditional Chinese.
+Context: live real-money TAIFEX MXF trend strategy "V38" on TradingView Pine (v30e / v30f) sends webhooks to a bot. Candidate rule LB7 must be reviewed before deploy.
+Rule LB7: once price has moved >=7% from the previous trading day's close in the direction of the current position, block NEW pyramid entries (Add and G). Cmd entries and existing lots unaffected. Trading day: bars whose close time >=15:00 Asia/Taipei belong to the next trading day; previous close = last 5-min close of previous trading day (normally 13:45).
+Files:
+1. Engine impl: E:\stock\v38_v29_snr_20261017\gap\fable_audit\round9\fa_run9.py — see _FA_STEP (_ST["prev"], _ST["last"]), _FA_CAPOK ("lb" branch), GX edits injecting _FA_CAPOK into Add/G entry conditions. Base engine: E:\stock_recovery\github_repos\tmf-bot\backtest\strategy_v26\engine_v26_bbw.py (entries ~lines 600-630).
+2. PREREG: E:\stock\v38_v29_snr_20261017\gap\fable_audit\round9\PREREG.md ; results ana9.txt / ana9b.txt.
+   Summary: 2024+ RR(net/|MDD|) 4-offset avg NOBE 4.85 vs LB7 5.51; sweep LB4 4.55, LB5 5.20, LB5.5 5.43, LB6 5.18, LB6.5 5.42, LB7 5.51, LB7.5 5.57, LB8 5.62, LB9 5.17. Placebo (30 seeds, random 8 day-session days with adds, block from random time): off0 LB7 8.65 vs P90 7.80 (0/30>=), off2 6.84 vs P90 6.39 (1/30>=). Concerns: only 7-9 trigger days since 2020; blocked adds themselves net positive (+3.8萬, 7 trades 2024+) so gain comes from path effects; ~15 variants tested today; idea post-hoc after a live trade.
+3. Pine: E:\stock\v38_v29_snr_20261017\TF_V38_v30e_lb7.pine and TF_V38_v30f_lb7.pine vs originals TF_V38_v30e.pine / TF_V38_v30f.pine (generator mk_v30g.py).
+Check: (A) engine correctness / look-ahead; (B) Pine matches engine semantics exactly (trading-day key via time_close, lbPrevClose=close[1] on key change, weekend/holiday behavior vs engine, bar-close evaluation, posSize sign), Pine v5 compile risks, any effect on alerts/webhook; (C) verdict DEPLOY / SHADOW-ONLY / REJECT with reasons, plus must-fix items.
+Output a concise report (<=500 words).
